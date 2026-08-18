@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@tailwindcss/postcss": "4.1.11",
+    "@tailwindcss/postcss": "4.3.3",
     "next": "16.1.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",

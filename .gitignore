@@ -1,5 +1,37 @@
-*conf*.json
+# Dependencies
+docs/agentic-starter-journey/node_modules
+
+# Production
+docs/agentic-starter-journey/out
+
+# Generated files
+docs/agentic-starter-journey/.next
+docs/agentic-starter-journey/next-env.d.ts
+docs/agentic-starter-journey/tsconfig.tsbuildinfo
+
+# Misc
 .DS_Store
-__pycache__
-.idea/
-.env
+
+# Local Captain / Crew eval artifacts (feedback, TF state, stacks)
+.local-eval/
+
+docs/agentic-starter-journey/.env.local
+docs/agentic-starter-journey/.env.development.local
+docs/agentic-starter-journey/.env.test.local
+docs/agentic-starter-journey/.env.production.local
+
+docs/agentic-starter-journey/npm-debug.log*
+docs/agentic-starter-journey/yarn-debug.log*
+docs/agentic-starter-journey/yarn-error.log*
+
+# Local agent tooling (ignore by default; commit Captain skill for peers)
+.cursor/*
+!.cursor/skills/
+.cursor/skills/*
+!.cursor/skills/captain/
+!.cursor/skills/captain/**
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/captain/
+!.claude/skills/captain/**

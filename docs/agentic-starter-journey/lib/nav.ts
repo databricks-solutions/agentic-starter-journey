@@ -38,7 +38,7 @@ export const SECTIONS: Section[] = [
     children: [
       { label: "Project repo", slug: "02-databricks-projects/project-repo" },
       { label: "Ingestion Pipelines", slug: "02-databricks-projects/ingestion-pipelines" },
-      { label: "ETL Pipelines", slug: "02-databricks-projects/etl-pipelines" },
+      { label: "Spark Declarative Pipelines", slug: "02-databricks-projects/etl-pipelines" },
     ],
   },
 ];

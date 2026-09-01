@@ -26,8 +26,7 @@ Successfully update the pipeline named `bakehouse_e2e_pipeline`.
 
 ## Skill
 
-Invoke `databricks-pipelines` before writing the pipeline code.
-Invoke `databricks-dabs` before writing the bundle resource.
+Read `databricks-pipelines` and `databricks-dabs`, but invoke them only after the auth precheck passes.
 
 ## Inputs
 
@@ -55,7 +54,11 @@ Refuse to continue if the brief or prior pages do not name all of these:
 databricks auth profiles
 
 databricks auth describe --profile <workspace-profile> -o json \
-  | jq '{host, account_id}'
+  | jq '{
+      host: (.host // .details.host),
+      account_id: (.account_id // .details.configuration.account_id.value),
+      workspace_id: (.workspace_id // .details.configuration.workspace_id.value)
+    }'
 
 databricks current-user me --profile <workspace-profile> -o json \
   | jq '{id, userName}'
@@ -67,10 +70,12 @@ databricks metastores current --profile <workspace-profile> -o json \
 Expected:
 
 - `<workspace-profile>` shows `Valid` = `YES` in `auth profiles`.
-- `auth describe` `host` equals the named workspace host, and `account_id` equals the named Databricks account id.
+- `auth describe` prints `{"host":"https://<deployment>.cloud.databricks.com","account_id":"<databricks-account-id>","workspace_id":"<workspace-id>"}` with no null values.
+- `auth describe` `host`, `account_id`, and `workspace_id` equal the named values.
 - `current-user me` succeeds with no auth error.
 - `metastores current` `workspace_id` equals the named workspace id.
 
+If any projected `auth describe` value is null, inspect the raw `databricks auth describe --profile <workspace-profile> -o json` response before prescribing re-login.
 On any failure: print **blocked: auth preflight failed**, list the failing check, give the human the remediation below, and stop.
 Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 
@@ -78,7 +83,7 @@ Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 |---|---|
 | Missing named account id, workspace id, host, or profile | Ask the human for all four before continuing |
 | Profile `Valid=NO` or auth error on describe | `databricks auth login --host <workspace-host> --profile <workspace-profile>` (or refresh the SP OAuth secret on the profile) |
-| Host or account id mismatch on `auth describe` | Re-login the profile against the named host; confirm the Databricks account id in the account console |
+| Host, account id, or workspace id mismatch on `auth describe` | Inspect the raw response, then re-login the profile against the named host if the configured values are wrong; confirm the Databricks account id in the account console |
 | `workspace_id` mismatch on `metastores current` | `databricks account workspaces list --profile <account-profile> -o json` and align id with the named host |
 | `current-user me` fails after profile is Valid | Workspace admin assigns the user or SP to the workspace |
 

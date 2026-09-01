@@ -85,6 +85,44 @@ Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 ### 1. Inspect the batch source
 
 Invoke `databricks-pipelines` and `databricks-dabs`.
+Define one helper that waits for SQL Statement Execution to finish:
+
+```bash
+run_sql() {
+  local statement=$1 response statement_id state
+
+  response=$(databricks api post /api/2.0/sql/statements \
+    --profile <workspace-profile> \
+    --json "$(jq -n \
+      --arg warehouse_id '<warehouse-id>' \
+      --arg statement "$statement" \
+      '{warehouse_id: $warehouse_id, statement: $statement, wait_timeout: "0s"}')") \
+    || return
+  statement_id=$(jq -er '.statement_id' <<<"$response") || return
+
+  while :; do
+    state=$(jq -er '.status.state' <<<"$response") || return
+    case "$state" in
+      SUCCEEDED)
+        printf '%s\n' "$response"
+        return 0
+        ;;
+      PENDING|RUNNING)
+        sleep 5
+        response=$(databricks api get "/api/2.0/sql/statements/$statement_id" \
+          --profile <workspace-profile>) || return
+        ;;
+      *)
+        jq -c '.status.error // .status' <<<"$response" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+```
+
+The helper prints results only for `SUCCEEDED`.
+It prints the API error and fails for every terminal failure state.
 Inspect all four source schemas before using source columns in expectations.
 
 ```bash
@@ -102,12 +140,7 @@ ORDER BY table_name, column_name
 SQL
 )
 
-databricks api post /api/2.0/sql/statements \
-  --profile <workspace-profile> \
-  --json "$(jq -n \
-    --arg warehouse_id '<warehouse-id>' \
-    --arg statement "$statement" \
-    '{warehouse_id: $warehouse_id, statement: $statement, wait_timeout: "50s"}')" \
+run_sql "$statement" \
   | jq -e '
       .result.data_array as $rows
       | {
@@ -227,7 +260,19 @@ Run from the existing project repository:
 ```bash
 databricks bundle validate --strict --target dev --profile <workspace-profile>
 databricks bundle deploy --target dev --profile <workspace-profile>
-databricks bundle run bakehouse_e2e_pipeline --target dev --profile <workspace-profile>
+
+pipeline_id=$(databricks bundle summary \
+  --target dev \
+  --profile <workspace-profile> \
+  -o json \
+  | jq -er '.resources.pipelines.bakehouse_e2e_pipeline.id')
+
+update_id=$(databricks bundle run bakehouse_e2e_pipeline \
+  --target dev \
+  --profile <workspace-profile> \
+  --no-wait \
+  -o json \
+  | jq -er '.update_id')
 ```
 
 ## Verify
@@ -235,11 +280,28 @@ databricks bundle run bakehouse_e2e_pipeline --target dev --profile <workspace-p
 Prove the bundle update completed and all eight governed tables exist:
 
 ```bash
-databricks bundle run bakehouse_e2e_pipeline \
-  --target dev \
-  --profile <workspace-profile> \
-  -o json \
-  | jq -e 'select(.state == "COMPLETED")'
+while :; do
+  update=$(databricks pipelines get-update \
+    "$pipeline_id" \
+    "$update_id" \
+    --profile <workspace-profile> \
+    -o json) || exit 1
+  state=$(jq -er '.update.state' <<<"$update") || exit 1
+  printf 'update=%s state=%s\n' "$update_id" "$state"
+
+  case "$state" in
+    COMPLETED)
+      break
+      ;;
+    FAILED|CANCELED)
+      jq '.update' <<<"$update" >&2
+      exit 1
+      ;;
+    *)
+      sleep 30
+      ;;
+  esac
+done
 
 for table in \
   <catalog>.bakehouse_bronze.sales_transactions_raw \
@@ -257,20 +319,6 @@ done
 ```
 
 Expected: the run state is `COMPLETED` and all eight exact table names print.
-
-Define a helper for the SQL Statement Execution API:
-
-```bash
-run_sql() {
-  local statement=$1
-  databricks api post /api/2.0/sql/statements \
-    --profile <workspace-profile> \
-    --json "$(jq -n \
-      --arg warehouse_id '<warehouse-id>' \
-      --arg statement "$statement" \
-      '{warehouse_id: $warehouse_id, statement: $statement, wait_timeout: "50s"}')"
-}
-```
 
 Use one query to prove every silver table has rows:
 
@@ -322,7 +370,7 @@ Expected: `[0, 0, 0]`.
 Prove all expectations emitted numeric counters:
 
 ```bash
-statement=$(cat <<'SQL'
+statement=$(cat <<SQL
 SELECT
   expectation.name,
   expectation.passed_records,
@@ -335,6 +383,7 @@ LATERAL VIEW explode(
   )
 ) exploded AS expectation
 WHERE event_type = 'flow_progress'
+  AND origin.update_id = '$update_id'
 QUALIFY row_number() OVER (
   PARTITION BY expectation.name
   ORDER BY timestamp DESC

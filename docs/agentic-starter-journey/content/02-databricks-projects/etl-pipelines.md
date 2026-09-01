@@ -54,7 +54,7 @@ Refuse to continue if the brief or prior pages do not name all of these:
 databricks auth profiles
 
 databricks auth describe --profile <workspace-profile> -o json \
-  | jq '{
+  | jq -c '{
       host: (.host // .details.host),
       account_id: (.account_id // .details.configuration.account_id.value),
       workspace_id: (.workspace_id // .details.configuration.workspace_id.value)

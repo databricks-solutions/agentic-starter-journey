@@ -4,7 +4,7 @@ updates:
   - package-ecosystem: "npm"
     directory: "/docs/agentic-starter-journey"
     schedule:
-      interval: "yearly"
+      interval: "semiannually"
     open-pull-requests-limit: 3
     ignore:
       - dependency-name: "*"
@@ -13,7 +13,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "yearly"
+      interval: "semiannually"
     open-pull-requests-limit: 3
     ignore:
       - dependency-name: "*"

@@ -128,7 +128,7 @@ run_sql() {
 
 The helper prints results only for `SUCCEEDED`.
 It prints the API error and fails for every terminal failure state.
-Inspect all four source schemas before using source columns in expectations.
+Confirm all four source tables exist, then confirm the three expectation columns on `sales_transactions`.
 
 ```bash
 statement=$(cat <<'SQL'
@@ -165,33 +165,59 @@ run_sql "$statement" \
         )'
 ```
 
-Expected: four table names and all three required transaction columns.
+Expected: all four source table names and all three required `sales_transactions` columns.
 Stop if `customerID`, `quantity`, or `franchiseID` is absent.
 
 ### 2. Write the pipeline source
 
-Create `src/bakehouse_pipeline/transformations.py`:
+Create one file per dataset.
+
+Create `src/bakehouse_pipeline/bronze/sales_transactions_raw.py`:
+
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_transactions_raw")
+def sales_transactions_raw():
+    return spark.read.table("samples.bakehouse.sales_transactions")
+```
+
+Create `src/bakehouse_pipeline/bronze/sales_customers_raw.py`:
+
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_customers_raw")
+def sales_customers_raw():
+    return spark.read.table("samples.bakehouse.sales_customers")
+```
+
+Create `src/bakehouse_pipeline/bronze/sales_franchises_raw.py`:
+
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_franchises_raw")
+def sales_franchises_raw():
+    return spark.read.table("samples.bakehouse.sales_franchises")
+```
+
+Create `src/bakehouse_pipeline/bronze/sales_suppliers_raw.py`:
+
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_suppliers_raw")
+def sales_suppliers_raw():
+    return spark.read.table("samples.bakehouse.sales_suppliers")
+```
+
+Create `src/bakehouse_pipeline/silver/transactions_clean.py`:
 
 ```python
 from pyspark import pipelines as dp
 
 silver_schema = spark.conf.get("silver_schema")
-
-@dp.materialized_view(name="sales_transactions_raw")
-def sales_transactions_raw():
-    return spark.read.table("samples.bakehouse.sales_transactions")
-
-@dp.materialized_view(name="sales_customers_raw")
-def sales_customers_raw():
-    return spark.read.table("samples.bakehouse.sales_customers")
-
-@dp.materialized_view(name="sales_franchises_raw")
-def sales_franchises_raw():
-    return spark.read.table("samples.bakehouse.sales_franchises")
-
-@dp.materialized_view(name="sales_suppliers_raw")
-def sales_suppliers_raw():
-    return spark.read.table("samples.bakehouse.sales_suppliers")
 
 @dp.materialized_view(name=f"{silver_schema}.transactions_clean")
 @dp.expect_or_drop("valid_customer", "customerID IS NOT NULL")
@@ -199,21 +225,45 @@ def sales_suppliers_raw():
 @dp.expect_or_drop("valid_franchise", "franchiseID IS NOT NULL")
 def transactions_clean():
     return spark.read.table("sales_transactions_raw")
+```
+
+Create `src/bakehouse_pipeline/silver/customers_clean.py`:
+
+```python
+from pyspark import pipelines as dp
+
+silver_schema = spark.conf.get("silver_schema")
 
 @dp.materialized_view(name=f"{silver_schema}.customers_clean")
 def customers_clean():
     return spark.read.table("sales_customers_raw")
+```
+
+Create `src/bakehouse_pipeline/silver/franchises_clean.py`:
+
+```python
+from pyspark import pipelines as dp
+
+silver_schema = spark.conf.get("silver_schema")
 
 @dp.materialized_view(name=f"{silver_schema}.franchises_clean")
 def franchises_clean():
     return spark.read.table("sales_franchises_raw")
+```
+
+Create `src/bakehouse_pipeline/silver/suppliers_clean.py`:
+
+```python
+from pyspark import pipelines as dp
+
+silver_schema = spark.conf.get("silver_schema")
 
 @dp.materialized_view(name=f"{silver_schema}.suppliers_clean")
 def suppliers_clean():
     return spark.read.table("sales_suppliers_raw")
 ```
 
-The default target publishes these bronze tables:
+The default target publishes these bronze materialized views:
 
 ```text
 bakehouse_bronze.sales_transactions_raw
@@ -222,7 +272,7 @@ bakehouse_bronze.sales_franchises_raw
 bakehouse_bronze.sales_suppliers_raw
 ```
 
-The configured silver schema publishes these tables:
+The configured silver schema publishes these materialized views:
 
 ```text
 bakehouse_silver.transactions_clean
@@ -257,6 +307,7 @@ resources:
 
 Both paths resolve relative to the YAML file under `resources/`.
 `${var.catalog}` prevents a hardcoded workspace catalog.
+Development mode may prefix the displayed workspace pipeline name, while the resource key `bakehouse_e2e_pipeline` remains the bundle command target.
 
 ### 4. Deploy and run
 
@@ -282,7 +333,7 @@ update_id=$(databricks bundle run bakehouse_e2e_pipeline \
 
 ## Verify
 
-Prove the bundle update completed and all eight governed tables exist:
+Prove the bundle update completed and all eight governed materialized views exist with the `tables get` API command:
 
 ```bash
 while :; do
@@ -323,9 +374,9 @@ do
 done
 ```
 
-Expected: the run state is `COMPLETED` and all eight exact table names print.
+Expected: the run state is `COMPLETED` and all eight exact materialized view names print.
 
-Use one query to prove every silver table has rows:
+Use one query to prove every silver materialized view has rows:
 
 ```bash
 statement=$(cat <<'SQL'

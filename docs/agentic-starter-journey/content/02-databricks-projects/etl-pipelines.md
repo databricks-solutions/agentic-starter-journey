@@ -214,15 +214,19 @@ def sales_suppliers_raw():
 
 Create `src/bakehouse_pipeline/silver/transactions_clean.py`:
 
+Group the three same-action quality rules in one `expect_all_or_drop` decorator.
+
 ```python
 from pyspark import pipelines as dp
 
 silver_schema = spark.conf.get("silver_schema")
 
 @dp.materialized_view(name=f"{silver_schema}.transactions_clean")
-@dp.expect_or_drop("valid_customer", "customerID IS NOT NULL")
-@dp.expect_or_drop("valid_quantity", "quantity > 0")
-@dp.expect_or_drop("valid_franchise", "franchiseID IS NOT NULL")
+@dp.expect_all_or_drop({
+    "valid_customer": "customerID IS NOT NULL",
+    "valid_quantity": "quantity > 0",
+    "valid_franchise": "franchiseID IS NOT NULL",
+})
 def transactions_clean():
     return spark.read.table("sales_transactions_raw")
 ```
@@ -477,7 +481,7 @@ An empty result fails the check.
 | A batch source fails validation as a stream | The source uses a streaming read | Use materialized views with `spark.read.table` |
 | Pipeline remains `INITIALIZING` for several minutes | Normal serverless cold start | Wait for the update and do not cancel it |
 | Polling reports an idle pipeline before work completes | The check polls top-level pipeline state | Poll the active update or use the blocking bundle run |
-| Expectation query returns no rows | Expectations did not attach or no flow progress event contains metrics | Inspect the update event log and fix the decorators before continuing |
+| Expectation query returns no rows | Expectations did not attach or no flow progress event contains metrics | Inspect the update event log and fix the grouped decorator before continuing |
 
 ## Next
 

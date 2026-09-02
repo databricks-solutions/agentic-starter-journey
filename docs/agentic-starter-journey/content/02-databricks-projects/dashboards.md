@@ -48,11 +48,16 @@ Test every SQL statement before deployment.
 
 ## Run
 
+Run every shell block in Run and Verify in the same Bash shell so resolved variables, helper functions, and fail-closed shell options persist.
+With strict mode active, any failed auth check, strict validation, dataset assertion, bundle-summary assertion, publish assertion, draft assertion, published assertion, deployed structure assertion, or deployed dataset assertion stops the workflow.
+
 ### 0. Verify auth and active-target inputs
 
 Require every human-provided input and fail closed if the profile reaches another target:
 
 ```bash
+set -euo pipefail
+
 : "${DATABRICKS_ACCOUNT_ID:?set the human-provided Databricks account ID}"
 : "${DATABRICKS_WORKSPACE_ID:?set the human-provided workspace ID}"
 : "${DATABRICKS_HOST:?set the human-provided workspace host}"

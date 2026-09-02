@@ -26,7 +26,11 @@ Successfully update the pipeline named `bakehouse_e2e_pipeline`.
 
 ## Skill
 
-Read `databricks-pipelines` and `databricks-dabs`, but invoke them only after the auth precheck passes.
+Read these skill names, but invoke them only after the auth precheck passes:
+
+1. `databricks-core`, the parent skill used first.
+2. `databricks-pipelines`.
+3. `databricks-dabs`.
 
 ## Inputs
 
@@ -89,7 +93,7 @@ Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 
 ### 1. Inspect the batch source
 
-Invoke `databricks-pipelines` and `databricks-dabs`.
+Invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
 Define one helper that waits for SQL Statement Execution to finish:
 
 ```bash

@@ -184,6 +184,7 @@ assert_kpis() {
       | .[0] == 66471
       and .[1] == 3333
       and .[2] > 0
+      and .[2] == 19.943294329432945
       and ((.[0] - (.[1] * .[2])) > -0.01)
       and ((.[0] - (.[1] * .[2])) < 0.01)
     )'
@@ -265,7 +266,7 @@ Parse the source and execute all four exact queries before deployment:
 dashboard_file=src/bakehouse_franchise_performance.lvdash.json
 jq -e '.' "$dashboard_file" >/dev/null
 assert_all_datasets "$dashboard_file" >/dev/null
-printf '%s\n' 'local_datasets=passed'
+printf '%s\n' 'local_datasets=passed kpis=66471,3333,19.943294329432945 trend=rows:17,first:2024-05-01:4128,last:2024-05-17:1932,total:66471 franchises=rows:10,leader:Baked Bliss:6642 products=rows:6,leader:Golden Gate Ginger:11595'
 ```
 
 Expected: JSON parsing and all source dataset assertions succeed.
@@ -307,6 +308,21 @@ Development presets are already applied in validation and summary output, so onl
 Deploy, resolve the dashboard ID only through bundle summary, and publish with positional CLI syntax:
 
 ```bash
+pre_deploy_summary=$(
+  databricks bundle summary \
+    --target dev \
+    --profile "$DATABRICKS_CONFIG_PROFILE" \
+    -o json
+)
+
+pre_existing_dashboard_id=$(
+  jq -r '
+    .resources.dashboards.bakehouse_franchise_performance.id
+    // empty
+    | tostring' \
+    <<<"$pre_deploy_summary"
+)
+
 databricks bundle deploy \
   --target dev \
   --profile "$DATABRICKS_CONFIG_PROFILE"
@@ -349,6 +365,11 @@ effective_display_name=$(
     <<<"$summary"
 )
 
+if test -n "$pre_existing_dashboard_id"
+then
+  test "$pre_existing_dashboard_id" = "$dashboard_id"
+fi
+
 dashboards=$(
   databricks lakeview list \
     --profile "$DATABRICKS_CONFIG_PROFILE" \
@@ -363,9 +384,10 @@ jq -e \
     and .[0].dashboard_id == $dashboard_id' \
   <<<"$dashboards" >/dev/null
 
-printf 'configured_display_name=%s\neffective_display_name=%s\ndashboard_id=%s\ndashboard_url=%s\n' \
-  "$configured_display_name" "$effective_display_name" "$dashboard_id" "$dashboard_url"
-printf '%s\n' 'bundle_summary_and_duplicate=passed'
+printf 'configured_display_name=%s\neffective_display_name=%s\ndashboard_url=%s\n' \
+  "$configured_display_name" "$effective_display_name" "$dashboard_url"
+printf 'bundle_summary_and_duplicate=passed pre_existing_dashboard_id=%s deployed_dashboard_id=%s matching_dashboards=1 duplicate_dashboards=0\n' \
+  "$pre_existing_dashboard_id" "$dashboard_id"
 
 published_after_publish=$(
   databricks lakeview publish "$dashboard_id" \
@@ -386,6 +408,7 @@ printf '%s\n' 'publish=passed'
 ```
 
 Expected: deployment succeeds, summary returns one nonempty dashboard ID and URL, the effective name is nonempty and ends with `Bakehouse Franchise Performance`, exactly one matching dashboard has the bundle-summary ID, and publish returns that effective name, the warehouse, and a revision timestamp.
+The pre-existing ID may be empty on first creation, but a nonempty value must equal the deployed ID.
 The list assertion detects duplicate or orphaned dashboards.
 
 ## Verify
@@ -530,7 +553,7 @@ Execute the deployed queries through the same API assertions:
 
 ```bash
 assert_all_datasets "$deployed_dashboard" >/dev/null
-printf '%s\n' 'deployed_datasets=passed'
+printf '%s\n' 'deployed_datasets=passed kpis=66471,3333,19.943294329432945 trend=rows:17,first:2024-05-01:4128,last:2024-05-17:1932,total:66471 franchises=rows:10,leader:Baked Bliss:6642 products=rows:6,leader:Golden Gate Ginger:11595'
 ```
 
 Expected: all four deployed datasets satisfy the same row and value assertions as the source.
@@ -553,6 +576,7 @@ No visual inspection may substitute for these executable checks.
 | Configured display-name assertion fails | The source YAML does not contain the exact `display_name: Bakehouse Franchise Performance` line | Restore the exact configured line in `resources/bakehouse_franchise_performance.dashboard.yml` and rerun its `rg -Fxq` assertion |
 | Effective display-name extraction fails | The deployed development name is empty or does not retain the configured name as its suffix | Inspect the target presets and require an effective name ending with `Bakehouse Franchise Performance` |
 | Dashboard ID extraction fails | Bundle summary lacks the exact resource key | Inspect deployment output and restore `bakehouse_franchise_performance` |
+| Dashboard identity-retention assertion fails | Deployment replaced an existing bundle-managed dashboard with a new ID | Stop and reconcile bundle state so updates retain the pre-existing dashboard ID |
 | Duplicate-dashboard assertion fails | More than one dashboard ends with the configured name or the only match has another ID | Remove or reconcile orphaned duplicates, then require the sole suffix match to equal the bundle-summary ID |
 | Publish fails or the published check fails | The principal cannot publish, the warehouse is wrong, or no published revision exists | Correct permission or warehouse access, republish the positional ID, and repeat both checks |
 | Deployed structure assertion fails | Server serialization or the deployed source differs from the locked contract | Compare the extracted object with the source, correct the source, and redeploy |

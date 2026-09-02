@@ -45,7 +45,7 @@ Read these verified upstream skills in this order, but invoke them only after th
 | Workspace CLI profile | Human-provided | Use the named profile for the target workspace |
 | Existing project path | Human-provided | Use the bundle project completed on the Project repo page |
 | Target catalog | Agent-derived | Read the existing bundle target's `catalog` variable |
-| SQL warehouse ID | Agent-derived | Select a running compatible warehouse available to the deployment principal |
+| SQL warehouse ID | Agent-derived | Read the active bundle target's `warehouse_id`; if missing, select one running compatible warehouse, write it into the active target, and use that exact value for the SQL task and `run_sql` |
 
 ## Run
 
@@ -91,6 +91,15 @@ Invoke the five skills in the listed order only after every check passes.
 ### 1. Verify the silver sources
 
 Change to the existing project path.
+Read `warehouse_id` from the active bundle target.
+If it is missing, select one running compatible warehouse available to the deployment principal and write its ID into the active target before continuing.
+Assign the exact active target value for Statement Execution:
+
+```bash
+warehouse_id='<active-target-warehouse-id>'
+test -n "$warehouse_id"
+```
+
 Define one helper that safely passes arbitrary SQL to the stable Statement Execution API, polls its statement ID, prints only successful results, and fails on every terminal error state:
 
 ```bash
@@ -102,7 +111,7 @@ run_sql() {
   response=$(databricks api post /api/2.0/sql/statements \
     --profile <workspace-profile> \
     --json "$(jq -n \
-      --arg warehouse_id '<warehouse-id>' \
+      --arg warehouse_id "$warehouse_id" \
       --arg statement "$statement" \
       '{warehouse_id: $warehouse_id, statement: $statement, wait_timeout: "0s"}')") \
     || return
@@ -297,6 +306,7 @@ variables:
 Merge only missing definitions into the existing `databricks.yml`.
 Do not replace the existing bundle configuration.
 Set target-specific `catalog` and `warehouse_id` values through the bundle's existing target structure.
+The active target's exact `warehouse_id` value must drive both `${var.warehouse_id}` in the deployed SQL task and the `warehouse_id` shell variable used by every `run_sql` verification.
 
 ### 4. Deploy and run
 
@@ -477,7 +487,7 @@ raw AS (
     COUNT(1) AS order_count,
     AVG(t.totalPrice) AS avg_order_value
   FROM <catalog>.bakehouse_silver.transactions_clean t
-  JOIN <catalog>.bakehouse_silver.franchises_clean f
+  LEFT JOIN <catalog>.bakehouse_silver.franchises_clean f
     ON t.franchiseID = f.franchiseID
   GROUP BY ALL
 ),
@@ -532,7 +542,8 @@ Expected: the aggregate query returns exactly one row, `metric_rows` is greater 
 | DDL contains unresolved `{{catalog}}` | The job parameter or bundle variable is missing | Restore the `catalog` job parameter and target variable |
 | Job reaches a terminal non-success state | The SQL task failed, was skipped, or encountered an internal error | Inspect the exact captured run and repair its task error before retrying |
 | Metric view creation rejects the YAML | The YAML version, join, dimension, or measure definition is invalid | Compare the committed DDL with the verified metric-view syntax and rerun the job |
-| Reconciliation reports mismatches | The semantic and raw definitions differ or source data changed between queries | Stop downstream work, rerun on a stable source, and align the measure expressions |
+| Deployed metadata assertion fails | The object type is wrong, display names or the join key drifted, or the warehouse cannot apply YAML 1.1 semantic metadata | Compare `DESCRIBE TABLE EXTENDED ... AS JSON` with the committed YAML, require one bundle and verification warehouse that supports YAML 1.1 semantic metadata, and rerun the job |
+| Reconciliation reports mismatches | The semantic and raw definitions differ | Stop downstream work and align the join and measure expressions |
 
 ## Next
 

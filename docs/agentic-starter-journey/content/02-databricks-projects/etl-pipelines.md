@@ -377,8 +377,8 @@ for table in \
   <catalog>.bakehouse_silver.franchises_clean \
   <catalog>.bakehouse_silver.suppliers_clean
 do
-  databricks tables get "$table" --profile <workspace-profile> -o json \
-    | jq -er 'select(.table_type == "MATERIALIZED_VIEW") | .full_name'
+  (databricks tables get "$table" --profile <workspace-profile> -o json \
+    | jq -er 'select(.table_type == "MATERIALIZED_VIEW") | .full_name') || exit 1
 done
 ```
 

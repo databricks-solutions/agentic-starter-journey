@@ -547,5 +547,6 @@ Expected: the aggregate query returns exactly one row, `metric_rows` is greater 
 
 ## Next
 
+- **Do next:** [Dashboards](/docs/02-databricks-projects/dashboards/)
 - **Back to section:** [Databricks Projects](/docs/02-databricks-projects/)
 - **Reference:** [Unity Catalog metric views](https://docs.databricks.com/metric-views/)

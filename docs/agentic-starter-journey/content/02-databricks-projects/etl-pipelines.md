@@ -28,9 +28,9 @@ Successfully update the pipeline named `bakehouse_e2e_pipeline`.
 
 Read these skill names, but invoke them only after the auth precheck passes:
 
-1. `databricks-core`, the parent skill used first.
-2. `databricks-pipelines`.
-3. `databricks-dabs`.
+1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core), the parent skill used first.
+2. [`databricks-pipelines`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-pipelines).
+3. [`databricks-dabs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dabs).
 
 ## Inputs
 

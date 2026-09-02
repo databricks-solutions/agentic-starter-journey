@@ -461,11 +461,17 @@ trap 'rm -f "$deployed_dashboard"' EXIT
 jq -er '.serialized_dashboard | fromjson' <<<"$draft" >"$deployed_dashboard"
 
 jq -e '
-  ([.datasets[] | {name, displayName}] == [
-    {"name":"ds_kpis","displayName":"Franchise performance KPIs"},
-    {"name":"ds_sales_trend","displayName":"Daily sales trend"},
-    {"name":"ds_franchises","displayName":"Top franchises"},
-    {"name":"ds_products","displayName":"Top products"}
+  ([.datasets[] | {name, displayName, queryLines}] == [
+    {"name":"ds_kpis","displayName":"Franchise performance KPIs","queryLines":["SELECT MEASURE(total_sales) AS total_sales,\n","       MEASURE(order_count) AS order_count,\n","       MEASURE(avg_order_value) AS avg_order_value\n","FROM franchise_sales_metrics "]},
+    {"name":"ds_sales_trend","displayName":"Daily sales trend","queryLines":["SELECT sales_date, MEASURE(total_sales) AS total_sales\n","FROM franchise_sales_metrics\n","GROUP BY sales_date\n","ORDER BY sales_date "]},
+    {"name":"ds_franchises","displayName":"Top franchises","queryLines":["SELECT franchise, MEASURE(total_sales) AS total_sales\n","FROM franchise_sales_metrics\n","GROUP BY franchise\n","ORDER BY total_sales DESC\n","LIMIT 10 "]},
+    {"name":"ds_products","displayName":"Top products","queryLines":["SELECT product, MEASURE(total_sales) AS total_sales\n","FROM franchise_sales_metrics\n","GROUP BY product\n","ORDER BY total_sales DESC\n","LIMIT 10 "]}
+  ])
+  and ([.datasets[].queryLines | join("")] == [
+    "SELECT MEASURE(total_sales) AS total_sales,\n       MEASURE(order_count) AS order_count,\n       MEASURE(avg_order_value) AS avg_order_value\nFROM franchise_sales_metrics ",
+    "SELECT sales_date, MEASURE(total_sales) AS total_sales\nFROM franchise_sales_metrics\nGROUP BY sales_date\nORDER BY sales_date ",
+    "SELECT franchise, MEASURE(total_sales) AS total_sales\nFROM franchise_sales_metrics\nGROUP BY franchise\nORDER BY total_sales DESC\nLIMIT 10 ",
+    "SELECT product, MEASURE(total_sales) AS total_sales\nFROM franchise_sales_metrics\nGROUP BY product\nORDER BY total_sales DESC\nLIMIT 10 "
   ])
   and (.pages | length == 1)
   and (.pages[0].name == "overview")
@@ -494,9 +500,13 @@ jq -e '
       | {
           name: .widget.name,
           title: .widget.spec.frame.title,
+          showTitle: .widget.spec.frame.showTitle,
+          description: (.widget.spec.frame.description // null),
           type: .widget.spec.widgetType,
           version: .widget.spec.version,
+          queryName: .widget.queries[0].name,
           dataset: .widget.queries[0].query.datasetName,
+          disaggregated: .widget.queries[0].query.disaggregated,
           fields: .widget.queries[0].query.fields,
           encodings: .widget.spec.encodings,
           position
@@ -505,9 +515,13 @@ jq -e '
       {
         "name":"total-sales-kpi",
         "title":"Total Sales",
+        "showTitle":true,
+        "description":null,
         "type":"counter",
         "version":2,
+        "queryName":"main_query",
         "dataset":"ds_kpis",
+        "disaggregated":true,
         "fields":[{"name":"total_sales","expression":"`total_sales`"}],
         "encodings":{"value":{"fieldName":"total_sales","displayName":"Total Sales","format":{"type":"number-plain","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}}},
         "position":{"x":0,"y":2,"width":4,"height":3}
@@ -515,9 +529,13 @@ jq -e '
       {
         "name":"order-count-kpi",
         "title":"Order Count",
+        "showTitle":true,
+        "description":null,
         "type":"counter",
         "version":2,
+        "queryName":"main_query",
         "dataset":"ds_kpis",
+        "disaggregated":true,
         "fields":[{"name":"order_count","expression":"`order_count`"}],
         "encodings":{"value":{"fieldName":"order_count","displayName":"Order Count","format":{"type":"number-plain","decimalPlaces":{"type":"exact","places":0}}}},
         "position":{"x":4,"y":2,"width":4,"height":3}
@@ -525,9 +543,13 @@ jq -e '
       {
         "name":"average-order-value-kpi",
         "title":"Average Order Value",
+        "showTitle":true,
+        "description":null,
         "type":"counter",
         "version":2,
+        "queryName":"main_query",
         "dataset":"ds_kpis",
+        "disaggregated":true,
         "fields":[{"name":"avg_order_value","expression":"`avg_order_value`"}],
         "encodings":{"value":{"fieldName":"avg_order_value","displayName":"Average Order Value","format":{"type":"number-plain","decimalPlaces":{"type":"exact","places":2}}}},
         "position":{"x":8,"y":2,"width":4,"height":3}
@@ -535,9 +557,13 @@ jq -e '
       {
         "name":"daily-sales-trend",
         "title":"Daily Sales Trend",
+        "showTitle":true,
+        "description":"Total sales by calendar day.",
         "type":"line",
         "version":3,
+        "queryName":"main_query",
         "dataset":"ds_sales_trend",
+        "disaggregated":true,
         "fields":[{"name":"sales_date","expression":"`sales_date`"},{"name":"total_sales","expression":"`total_sales`"}],
         "encodings":{"x":{"fieldName":"sales_date","displayName":"Sales Date","scale":{"type":"temporal"}},"y":{"fieldName":"total_sales","displayName":"Total Sales","scale":{"type":"quantitative","domainMin":0},"format":{"type":"number","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}}},
         "position":{"x":0,"y":5,"width":12,"height":6}
@@ -545,9 +571,13 @@ jq -e '
       {
         "name":"top-franchises",
         "title":"Top Franchises",
+        "showTitle":true,
+        "description":"Ten franchises with the highest total sales.",
         "type":"bar",
         "version":3,
+        "queryName":"main_query",
         "dataset":"ds_franchises",
+        "disaggregated":true,
         "fields":[{"name":"franchise","expression":"`franchise`"},{"name":"total_sales","expression":"`total_sales`"}],
         "encodings":{"x":{"fieldName":"total_sales","displayName":"Total Sales","scale":{"type":"quantitative","domainMin":0},"format":{"type":"number","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}},"y":{"fieldName":"franchise","displayName":"Franchise","scale":{"type":"categorical"}}},
         "position":{"x":0,"y":11,"width":6,"height":6}
@@ -555,9 +585,13 @@ jq -e '
       {
         "name":"top-products",
         "title":"Top Products",
+        "showTitle":true,
+        "description":"Products ranked by total sales.",
         "type":"bar",
         "version":3,
+        "queryName":"main_query",
         "dataset":"ds_products",
+        "disaggregated":true,
         "fields":[{"name":"product","expression":"`product`"},{"name":"total_sales","expression":"`total_sales`"}],
         "encodings":{"x":{"fieldName":"total_sales","displayName":"Total Sales","scale":{"type":"quantitative","domainMin":0},"format":{"type":"number","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}},"y":{"fieldName":"product","displayName":"Product","scale":{"type":"categorical"}}},
         "position":{"x":6,"y":11,"width":6,"height":6}

@@ -136,7 +136,7 @@ run_sql() {
     state=$(jq -er '.status.state' <<<"$response") || return
     case "$state" in
       SUCCEEDED)
-        jq -e '.status.state == "SUCCEEDED" and .result.data_array != null' <<<"$response" >/dev/null
+        jq -e '.status.state == "SUCCEEDED" and .result.data_array != null' <<<"$response" >/dev/null || return
         printf '%s\n' "$response"
         return
         ;;
@@ -227,18 +227,19 @@ assert_products() {
 
 assert_all_datasets() {
   local dashboard_file=$1 sql
+  set -o pipefail
 
-  sql=$(dataset_sql "$dashboard_file" ds_kpis)
-  run_sql "$sql" | assert_kpis
+  sql=$(dataset_sql "$dashboard_file" ds_kpis) || return
+  run_sql "$sql" | assert_kpis || return
 
-  sql=$(dataset_sql "$dashboard_file" ds_sales_trend)
-  run_sql "$sql" | assert_sales_trend
+  sql=$(dataset_sql "$dashboard_file" ds_sales_trend) || return
+  run_sql "$sql" | assert_sales_trend || return
 
-  sql=$(dataset_sql "$dashboard_file" ds_franchises)
-  run_sql "$sql" | assert_franchises
+  sql=$(dataset_sql "$dashboard_file" ds_franchises) || return
+  run_sql "$sql" | assert_franchises || return
 
-  sql=$(dataset_sql "$dashboard_file" ds_products)
-  run_sql "$sql" | assert_products
+  sql=$(dataset_sql "$dashboard_file" ds_products) || return
+  run_sql "$sql" | assert_products || return
 }
 ```
 
@@ -764,6 +765,16 @@ summary=$(
     -o json
 )
 
+jq -e \
+  --arg catalog "$catalog" '
+    .resources.dashboards.bakehouse_franchise_performance
+    | .id != null
+    and (.id | tostring | length > 0)
+    and (.url | type == "string" and length > 0)
+    and .dataset_catalog == $catalog
+    and .dataset_schema == "bakehouse_gold"' \
+  <<<"$summary"
+
 dashboard_id=$(
   jq -er '
     .resources.dashboards.bakehouse_franchise_performance.id
@@ -815,13 +826,10 @@ published=$(
 
 jq -e \
   --arg dashboard_id "$dashboard_id" \
-  --arg warehouse_id "$warehouse_id" \
-  --arg catalog "$catalog" '
+  --arg warehouse_id "$warehouse_id" '
     .dashboard_id == $dashboard_id
     and .display_name == "Bakehouse Franchise Performance"
     and .warehouse_id == $warehouse_id
-    and .dataset_catalog == $catalog
-    and .dataset_schema == "bakehouse_gold"
     and (.serialized_dashboard | type == "string" and length > 0)' \
   <<<"$draft"
 
@@ -833,7 +841,7 @@ jq -e \
   <<<"$published"
 ```
 
-Expected: draft metadata and serialized content match the requested resource, and the published object has the exact name, warehouse, and revision timestamp.
+Expected: bundle summary proves the requested namespace, draft metadata and serialized content match the deployed resource, and the published object has the exact name, warehouse, and revision timestamp.
 
 Extract and assert the deployed serialized dashboard:
 
@@ -909,8 +917,23 @@ jq -e '
   and (.uiSettings.theme.canvasBackgroundColor.dark == "#111827")
   and (.uiSettings.theme.widgetBackgroundColor.light == "#FFFFFF")
   and (.uiSettings.theme.widgetBackgroundColor.dark == "#1F2937")
+  and (.uiSettings.theme.widgetBorderColor.light == "#FFFFFF")
+  and (.uiSettings.theme.widgetBorderColor.dark == "#1F2937")
   and (.uiSettings.theme.fontColor.light == "#172033")
   and (.uiSettings.theme.fontColor.dark == "#F3F4F6")
+  and (.uiSettings.theme.selectionColor.light == "#0072B2")
+  and (.uiSettings.theme.selectionColor.dark == "#56B4E9")
+  and (.uiSettings.theme.visualizationColors == [
+    "#0072B2",
+    "#E69F00",
+    "#009E73",
+    "#CC79A7",
+    "#D55E00",
+    "#56B4E9"
+  ])
+  and (.uiSettings.theme.widgetHeaderAlignment == "LEFT")
+  and (.uiSettings.theme.fontFamily == "Inter")
+  and (.uiSettings.theme.widgetCornerRadius == 8)
 ' "$deployed_dashboard"
 ```
 

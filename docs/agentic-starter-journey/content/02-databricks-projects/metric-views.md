@@ -223,33 +223,41 @@ source: ' || current_catalog() || '.bakehouse_silver.transactions_clean
 joins:
   - name: franchise_details
     source: ' || current_catalog() || '.bakehouse_silver.franchises_clean
-    on: source.franchiseID = franchise_details.franchiseID
+    ''on'': source.franchiseID = franchise_details.franchiseID
 
 dimensions:
   - name: franchise
+    display_name: Franchise
     expr: franchise_details.name
     comment: Franchise display name.
   - name: sales_date
+    display_name: Sales Date
     expr: DATE(source.dateTime)
     comment: Calendar date of the sale.
   - name: product
+    display_name: Product
     expr: source.product
     comment: Sold Bakehouse product.
 
 measures:
   - name: total_sales
+    display_name: Total Sales
     expr: SUM(source.totalPrice)
     comment: Total sales value.
   - name: order_count
+    display_name: Order Count
     expr: COUNT(1)
     comment: Number of sales transactions.
   - name: avg_order_value
+    display_name: Average Order Value
     expr: AVG(source.totalPrice)
     comment: Average value per transaction.
 $$';
 
 EXECUTE IMMEDIATE metric_view_ddl;
 ```
+
+The doubled SQL quotes render the YAML join key as `'on'`.
 
 ### 3. Add the unscheduled SQL job
 
@@ -298,19 +306,24 @@ Run from the existing project repository:
 databricks bundle validate --strict --target dev --profile <workspace-profile>
 databricks bundle deploy --target dev --profile <workspace-profile>
 
-run_id=$(databricks bundle run bakehouse_franchise_sales_metrics \
+job_id=$(databricks bundle summary \
   --target dev \
   --profile <workspace-profile> \
+  -o json \
+  | jq -er '.resources.jobs.bakehouse_franchise_sales_metrics.id | tostring')
+
+run_id=$(databricks jobs run-now "$job_id" \
+  --profile <workspace-profile> \
   --no-wait \
-  -o json | jq -er '.run_id')
+  -o json \
+  | jq -er '.run_id | tostring')
 ```
 
 Poll that exact run until it terminates:
 
 ```bash
 while :; do
-  run=$(databricks jobs get-run \
-    --run-id "$run_id" \
+  run=$(databricks jobs get-run "$run_id" \
     --profile <workspace-profile> \
     -o json) || exit 1
   life_cycle_state=$(jq -er '.state.life_cycle_state' <<<"$run") || exit 1

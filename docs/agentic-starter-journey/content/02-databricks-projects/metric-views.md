@@ -211,17 +211,18 @@ CREATE SCHEMA IF NOT EXISTS IDENTIFIER({{catalog}} || '.bakehouse_gold');
 USE CATALOG IDENTIFIER({{catalog}});
 USE SCHEMA bakehouse_gold;
 
-CREATE OR REPLACE VIEW franchise_sales_metrics
+DECLARE OR REPLACE VARIABLE metric_view_ddl STRING DEFAULT
+'CREATE OR REPLACE VIEW franchise_sales_metrics
 WITH METRICS
 LANGUAGE YAML
 AS $$
 version: 1.1
 comment: Governed Bakehouse franchise sales metrics.
-source: {{catalog}}.bakehouse_silver.transactions_clean
+source: ' || current_catalog() || '.bakehouse_silver.transactions_clean
 
 joins:
   - name: franchise_details
-    source: {{catalog}}.bakehouse_silver.franchises_clean
+    source: ' || current_catalog() || '.bakehouse_silver.franchises_clean
     on: source.franchiseID = franchise_details.franchiseID
 
 dimensions:
@@ -245,7 +246,9 @@ measures:
   - name: avg_order_value
     expr: AVG(source.totalPrice)
     comment: Average value per transaction.
-$$;
+$$';
+
+EXECUTE IMMEDIATE metric_view_ddl;
 ```
 
 ### 3. Add the unscheduled SQL job
@@ -380,6 +383,9 @@ SELECT
     franchise IS NULL
     OR sales_date IS NULL
     OR product IS NULL
+    OR total_sales IS NULL
+    OR order_count IS NULL
+    OR avg_order_value IS NULL
     OR total_sales <= 0
     OR order_count <= 0
     OR avg_order_value < 0
@@ -433,6 +439,12 @@ mismatches AS (
   FULL OUTER JOIN raw r USING (franchise, sales_date, product)
   WHERE m.franchise IS NULL
      OR r.franchise IS NULL
+     OR m.total_sales IS NULL
+     OR r.total_sales IS NULL
+     OR m.order_count IS NULL
+     OR r.order_count IS NULL
+     OR m.avg_order_value IS NULL
+     OR r.avg_order_value IS NULL
      OR abs(m.total_sales - r.total_sales) > 0.01
      OR m.order_count <> r.order_count
      OR abs(m.avg_order_value - r.avg_order_value) > 0.01

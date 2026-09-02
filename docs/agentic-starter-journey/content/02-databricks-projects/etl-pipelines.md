@@ -378,11 +378,12 @@ for table in \
   <catalog>.bakehouse_silver.suppliers_clean
 do
   databricks tables get "$table" --profile <workspace-profile> -o json \
-    | jq -er '.full_name'
+    | jq -er 'select(.table_type == "MATERIALIZED_VIEW") | .full_name'
 done
 ```
 
-Expected: the run state is `COMPLETED` and all eight exact materialized view names print.
+Expected: the run state is `COMPLETED`, every response has `table_type` equal to `MATERIALIZED_VIEW`, and all eight exact materialized view names print.
+Any other object type fails the check.
 
 Use one query to prove every silver materialized view has rows:
 

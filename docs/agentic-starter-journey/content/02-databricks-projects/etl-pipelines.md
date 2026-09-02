@@ -490,5 +490,6 @@ An empty result fails the check.
 
 ## Next
 
+- **Do next:** [Metric Views](/docs/02-databricks-projects/metric-views/)
 - **Manual fallback:** [Starter Journey: build the first pipeline](https://databricks-solutions.github.io/starter-journey/docs/07-build-first-pipeline/)
 - **Reference:** [Lakeflow Spark Declarative Pipelines](https://docs.databricks.com/aws/en/ldp/)

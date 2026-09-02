@@ -746,13 +746,23 @@ resources:
 Strictly validate the local configuration:
 
 ```bash
-databricks bundle validate \
-  --strict \
-  --target dev \
-  --profile "$DATABRICKS_CONFIG_PROFILE"
+validated_bundle=$(
+  databricks bundle validate \
+    --strict \
+    --target dev \
+    --profile "$DATABRICKS_CONFIG_PROFILE" \
+    -o json
+)
+
+configured_display_name=$(
+  jq -er '
+    .resources.dashboards.bakehouse_franchise_performance.display_name
+    | select(. == "Bakehouse Franchise Performance")' \
+    <<<"$validated_bundle"
+)
 ```
 
-Expected: strict validation succeeds with the dashboard resource key and all native fields.
+Expected: strict validation succeeds and the configured dashboard resource display name is exactly `Bakehouse Franchise Performance`.
 
 ### 4. Deploy and publish
 
@@ -793,7 +803,16 @@ dashboard_url=$(
     <<<"$summary"
 )
 
-printf 'dashboard_id=%s\ndashboard_url=%s\n' "$dashboard_id" "$dashboard_url"
+effective_display_name=$(
+  jq -er '
+    .resources.dashboards.bakehouse_franchise_performance.display_name
+    | select(type == "string" and length > 0)
+    | select(endswith("Bakehouse Franchise Performance"))' \
+    <<<"$summary"
+)
+
+printf 'configured_display_name=%s\neffective_display_name=%s\ndashboard_id=%s\ndashboard_url=%s\n' \
+  "$configured_display_name" "$effective_display_name" "$dashboard_id" "$dashboard_url"
 
 published_after_publish=$(
   databricks lakeview publish "$dashboard_id" \
@@ -803,14 +822,15 @@ published_after_publish=$(
 )
 
 jq -e \
+  --arg effective_display_name "$effective_display_name" \
   --arg warehouse_id "$warehouse_id" '
-    .display_name == "Bakehouse Franchise Performance"
+    .display_name == $effective_display_name
     and .warehouse_id == $warehouse_id
     and (.revision_create_time | type == "string" and length > 0)' \
   <<<"$published_after_publish"
 ```
 
-Expected: deployment succeeds, summary returns one nonempty dashboard ID and URL, and publish returns the exact display name, warehouse, and a revision timestamp.
+Expected: deployment succeeds, summary returns one nonempty dashboard ID and URL, the effective name is nonempty and ends with `Bakehouse Franchise Performance`, and publish returns that effective name, the warehouse, and a revision timestamp.
 
 ## Verify
 
@@ -831,22 +851,24 @@ published=$(
 
 jq -e \
   --arg dashboard_id "$dashboard_id" \
+  --arg effective_display_name "$effective_display_name" \
   --arg warehouse_id "$warehouse_id" '
     .dashboard_id == $dashboard_id
-    and .display_name == "Bakehouse Franchise Performance"
+    and .display_name == $effective_display_name
     and .warehouse_id == $warehouse_id
     and (.serialized_dashboard | type == "string" and length > 0)' \
   <<<"$draft"
 
 jq -e \
+  --arg effective_display_name "$effective_display_name" \
   --arg warehouse_id "$warehouse_id" '
-    .display_name == "Bakehouse Franchise Performance"
+    .display_name == $effective_display_name
     and .warehouse_id == $warehouse_id
     and (.revision_create_time | type == "string" and length > 0)' \
   <<<"$published"
 ```
 
-Expected: bundle summary proves the requested namespace, draft metadata and serialized content match the deployed resource, and the published object has the exact name, warehouse, and revision timestamp.
+Expected: bundle summary proves the requested namespace, draft metadata and serialized content use the effective deployed name, and the published object has that name, the warehouse, and a revision timestamp.
 
 Extract and assert the deployed serialized dashboard:
 
@@ -967,6 +989,8 @@ No visual inspection may substitute for these executable checks.
 | A widget is invalid | A counter is not version 2 or a line or bar is not version 3 | Restore the exact widget versions |
 | A widget has no selected fields | A query field name differs from its encoding field name | Restore the exact locked field bindings |
 | Strict bundle validation fails | The native resource is malformed or its source path is wrong | Restore the exact resource and the `../src` path |
+| Configured display-name assertion fails | The source-controlled resource name differs from `Bakehouse Franchise Performance` | Restore the exact configured `display_name` and strictly validate again |
+| Effective display-name extraction fails | The deployed development name is empty or does not retain the configured name as its suffix | Inspect the target presets and require an effective name ending with `Bakehouse Franchise Performance` |
 | Dashboard ID extraction fails | Bundle summary lacks the exact resource key | Inspect deployment output and restore `bakehouse_franchise_performance` |
 | Publish fails or the published check fails | The principal cannot publish, the warehouse is wrong, or no published revision exists | Correct permission or warehouse access, republish the positional ID, and repeat both checks |
 | Deployed structure assertion fails | Server serialization or the deployed source differs from the locked contract | Compare the extracted object with the source, correct the source, and redeploy |

@@ -353,6 +353,43 @@ done
 Expected: the exact captured run reaches `TERMINATED` with result state `SUCCESS`.
 Internal errors, skipped runs, and every other terminal outcome fail the check.
 
+Verify the deployed object type and semantic metadata:
+
+```bash
+statement=$(cat <<'SQL'
+DESCRIBE TABLE EXTENDED <catalog>.bakehouse_gold.franchise_sales_metrics AS JSON
+SQL
+)
+
+run_sql "$statement" \
+  | jq -e '
+      .result.data_array[0][0]
+      | fromjson
+      | . as $description
+      | ([
+          $description.columns[]
+          | {key: .name, value: .metadata.display_name}
+        ] | from_entries) as $display_names
+      | select(
+          $description.type == "METRIC_VIEW"
+          and $display_names == {
+            franchise: "Franchise",
+            sales_date: "Sales Date",
+            product: "Product",
+            total_sales: "Total Sales",
+            order_count: "Order Count",
+            avg_order_value: "Average Order Value"
+          }
+          and (
+            $description.view_text
+            | contains("\"on\": source.franchiseID = franchise_details.franchiseID")
+          )
+        )'
+```
+
+Expected: one parsed description with type `METRIC_VIEW`, the six exact display names, and `"on": source.franchiseID = franchise_details.franchiseID` in `view_text`.
+Missing or drifted object type, column metadata, join key quoting, or join expression fails the check.
+
 ## Verify
 
 Query all dimensions and measures:
@@ -374,8 +411,9 @@ SQL
 run_sql "$statement" >/tmp/bakehouse-franchise-sales-metrics.json
 ```
 
-Expected: at least one row, non-null dimensions, positive total sales and order count, and non-negative average order value.
-Prove those conditions over the complete result:
+Expected inspection evidence: the saved full semantic query contains the dimensions and measures for every returned group.
+This saved result is inspection evidence and is not the pass or fail assertion.
+The immediately following aggregate query is the authoritative executable validity assertion for row presence, non-null dimensions and measures, positive total sales and order count, and non-negative average order value:
 
 ```bash
 statement=$(cat <<'SQL'

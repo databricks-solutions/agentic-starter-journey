@@ -88,7 +88,7 @@ Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 | Missing named account id, workspace id, host, or profile | Ask the human for all four before continuing |
 | Profile `Valid=NO` or auth error on describe | `databricks auth login --host <workspace-host> --profile <workspace-profile>` (or refresh the SP OAuth secret on the profile) |
 | Host, account id, or workspace id mismatch on `auth describe` | Inspect the raw response, then re-login the profile against the named host if the configured values are wrong; confirm the Databricks account id in the account console |
-| `workspace_id` mismatch on `metastores current` | `databricks account workspaces list --profile <account-profile> -o json` and align id with the named host |
+| `workspace_id` mismatch on `metastores current` | Inspect the `workspace_id` and `host` projected by `auth describe`, align the human-named workspace ID and host with the profile, and run `databricks auth login --host <workspace-host> --profile <workspace-profile>` if they differ |
 | `current-user me` fails after profile is Valid | Workspace admin assigns the user or SP to the workspace |
 
 ### 1. Inspect the batch source

@@ -1,49 +1,47 @@
 ---
-description: Build the medallion bronze, silver, gold ETL pipeline as a bundle resource with databricks-pipelines. Layer mapping, run steps, verification, and failure modes.
+description: bakehouse_e2e_pipeline reads samples.bakehouse and publishes governed bronze and silver materialized views with enforced expectations.
 ---
 
-# ETL Pipelines
+# Spark Declarative Pipelines
 
 ## Mental Model
 
-ETL is the transformation layer on top of ingested data. A Lakeflow Spark Declarative Pipeline (SDP) holds the bronze, silver, and gold datasets in one pipeline resource, with expectations for data quality.
-Bronze is raw, exactly as it arrived. Silver is cleaned and conformed. Gold is aggregates over the full dataset.
-The dataset type per layer is load-bearing: a streaming table is append-only and will not recompute an aggregate when source rows change; a materialized view does.
+`samples.bakehouse` is a batch source.
+Bronze preserves source rows.
+Silver applies quality rules.
+Batch inputs use materialized views and `spark.read.table`.
+The existing project DABs bundle owns and deploys the pipeline.
 
 ## Goal
 
-A bronze, silver, gold SDP defined as a bundle resource, deployed and running against the dev target.
+Successfully update the pipeline named `bakehouse_e2e_pipeline`.
 
 ## Prerequisites
 
 - Auth surface: `workspace`.
-- [Project repo](/docs/02-databricks-projects/project-repo/) set up: a Git repo with a `databricks.yml` bundle and a dev target.
-- A configured Databricks CLI profile that reaches the dev workspace.
-- [Ingestion Pipelines](/docs/02-databricks-projects/ingestion-pipelines/) complete, so bronze has data in it.
+- Complete the [Project repo](/docs/02-databricks-projects/project-repo/) outcome.
+- Use a target catalog that contains `bakehouse_bronze` and `bakehouse_silver`.
+- Confirm the deployment principal can read `samples.bakehouse`.
+- Use a SQL warehouse for verification.
 
 ## Skill
 
-`databricks-pipelines` (databricks-agent-skills). Invoke it before writing any pipeline code, not after. `databricks-dabs` for the resource YAML.
+Read these skill names, but invoke them only after the auth precheck passes:
+
+1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core), the parent skill used first.
+2. [`databricks-pipelines`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-pipelines).
+3. [`databricks-dabs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dabs).
 
 ## Inputs
 
-Collect all of these before writing code. The first four decide the pipeline's shape; get them wrong and the fix is dropping tables, not editing YAML.
-
 | Input | Source | How to obtain |
 |---|---|---|
-| Source table | Human | The bronze table from Ingestion Pipelines, `<catalog>.<project>_bronze.<table>` |
-| Update semantics | Human | Append only, or upserts and change tracking. Upserts mean Auto CDC and need a key plus a sequence column. |
-| Expectations | Human | The actual rules: which columns are never null, which ranges are valid, what a duplicate means. Push for specifics. |
-| Language | Human | SQL or Python. Sinks, ForEachBatch sinks, CDC from snapshots, and custom data sources are Python-only. |
-| Target catalog | You derive | The bundle's `catalog` variable |
-| Target schemas | You derive | `<project>_bronze`, `<project>_silver`, `<project>_gold` |
-| Serverless? | You derive | Default yes. Automatic incremental refresh of aggregating materialized views needs serverless plus Delta row tracking on the source. |
-
-:::warning
-Ask the arrival pattern before choosing a dataset type.
-A streaming source needs a streaming table; a batch source needs a materialized view.
-You cannot change a streaming table into a materialized view in place, and a full refresh does not help: the table has to be dropped or the dataset renamed.
-:::
+| Existing project repository path | Human-provided | Use the repository completed on the Project repo page |
+| Target catalog | Agent-derived | Read the active bundle target's `catalog` variable |
+| Workspace profile | Human-provided | Use the named Databricks CLI profile for the target workspace |
+| Workspace host and workspace ID | Agent-derived | Read the named profile and `databricks metastores current` |
+| SQL warehouse ID | Agent-derived | Select a running warehouse available to the deployment principal |
+| Language | Agent-derived, fixed runbook decision | Use Python |
 
 ## Run
 
@@ -60,7 +58,11 @@ Refuse to continue if the brief or prior pages do not name all of these:
 databricks auth profiles
 
 databricks auth describe --profile <workspace-profile> -o json \
-  | jq '{host, account_id}'
+  | jq -c '{
+      host: (.host // .details.host),
+      account_id: (.account_id // .details.configuration.account_id.value),
+      workspace_id: (.workspace_id // .details.configuration.workspace_id.value)
+    }'
 
 databricks current-user me --profile <workspace-profile> -o json \
   | jq '{id, userName}'
@@ -72,10 +74,12 @@ databricks metastores current --profile <workspace-profile> -o json \
 Expected:
 
 - `<workspace-profile>` shows `Valid` = `YES` in `auth profiles`.
-- `auth describe` `host` equals the named workspace host, and `account_id` equals the named Databricks account id.
+- `auth describe` prints `{"host":"https://<deployment>.cloud.databricks.com","account_id":"<databricks-account-id>","workspace_id":"<workspace-id>"}` with no null values.
+- `auth describe` `host`, `account_id`, and `workspace_id` equal the named values.
 - `current-user me` succeeds with no auth error.
 - `metastores current` `workspace_id` equals the named workspace id.
 
+If any projected `auth describe` value is null, inspect the raw `databricks auth describe --profile <workspace-profile> -o json` response before prescribing re-login.
 On any failure: print **blocked: auth preflight failed**, list the failing check, give the human the remediation below, and stop.
 Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 
@@ -83,129 +87,406 @@ Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 |---|---|
 | Missing named account id, workspace id, host, or profile | Ask the human for all four before continuing |
 | Profile `Valid=NO` or auth error on describe | `databricks auth login --host <workspace-host> --profile <workspace-profile>` (or refresh the SP OAuth secret on the profile) |
-| Host or account id mismatch on `auth describe` | Re-login the profile against the named host; confirm the Databricks account id in the account console |
-| `workspace_id` mismatch on `metastores current` | `databricks account workspaces list --profile <account-profile> -o json` and align id with the named host |
+| Host, account id, or workspace id mismatch on `auth describe` | Inspect the raw response, then re-login the profile against the named host if the configured values are wrong; confirm the Databricks account id in the account console |
+| `workspace_id` mismatch on `metastores current` | Inspect the `workspace_id` and `host` projected by `auth describe`, align the human-named workspace ID and host with the profile, and run `databricks auth login --host <workspace-host> --profile <workspace-profile>` if they differ |
 | `current-user me` fails after profile is Valid | Workspace admin assigns the user or SP to the workspace |
 
-### 1. The layer mapping
+### 1. Inspect the batch source
 
-| Layer | Dataset type | Why |
-|---|---|---|
-| Bronze | Streaming table with Auto Loader (or the ingested table from Ingestion Pipelines) | Raw, exactly as it arrived. Nothing filtered or deduplicated, so a broken downstream transformation can be reprocessed from here. |
-| Silver | Streaming table, or a streaming table populated by Auto CDC for upserts | Cleaned, deduplicated, conformed. The source of truth for ad-hoc queries. |
-| Gold | Materialized view | Aggregates over the full dataset. A streaming table is append-only and will not recompute an aggregate when source rows change; a materialized view does. |
+Invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
+Define one helper that waits for SQL Statement Execution to finish:
 
-Gold reading from a streaming table needs a **batch** read, `spark.read.table` in Python or `SELECT ... FROM <table>` without `STREAM` in SQL. Using a streaming read for an aggregation is the most common mistake in this layer.
+```bash
+run_sql() {
+  local statement=$1 response statement_id state
+
+  response=$(databricks api post /api/2.0/sql/statements \
+    --profile <workspace-profile> \
+    --json "$(jq -n \
+      --arg warehouse_id '<warehouse-id>' \
+      --arg statement "$statement" \
+      '{warehouse_id: $warehouse_id, statement: $statement, wait_timeout: "0s"}')") \
+    || return
+  statement_id=$(jq -er '.statement_id' <<<"$response") || return
+
+  while :; do
+    state=$(jq -er '.status.state' <<<"$response") || return
+    case "$state" in
+      SUCCEEDED)
+        printf '%s\n' "$response"
+        return 0
+        ;;
+      PENDING|RUNNING)
+        sleep 5
+        response=$(databricks api get "/api/2.0/sql/statements/$statement_id" \
+          --profile <workspace-profile>) || return
+        ;;
+      *)
+        jq -c '.status.error // .status' <<<"$response" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+```
+
+The helper prints results only for `SUCCEEDED`.
+It prints the API error and fails for every terminal failure state.
+Confirm all four source tables exist, then confirm the three expectation columns on `sales_transactions`.
+
+```bash
+statement=$(cat <<'SQL'
+SELECT table_name, column_name, full_data_type
+FROM samples.information_schema.columns
+WHERE table_schema = 'bakehouse'
+  AND table_name IN (
+    'sales_transactions',
+    'sales_customers',
+    'sales_franchises',
+    'sales_suppliers'
+  )
+ORDER BY table_name, column_name
+SQL
+)
+
+run_sql "$statement" \
+  | jq -e '
+      .result.data_array as $rows
+      | {
+          tables: ([$rows[][0]] | unique),
+          transaction_columns: ([
+            $rows[]
+            | select(
+                .[0] == "sales_transactions"
+                and (.[1] == "customerID" or .[1] == "quantity" or .[1] == "franchiseID")
+              )
+            | .[1]
+          ] | sort)
+        }
+      | select(
+          (.tables | length) == 4
+          and .transaction_columns == ["customerID", "franchiseID", "quantity"]
+        )'
+```
+
+Expected: all four source table names and all three required `sales_transactions` columns.
+Stop if `customerID`, `quantity`, or `franchiseID` is absent.
 
 ### 2. Write the pipeline source
 
-Invoke `databricks-pipelines` with the collected inputs. Its decision tree picks the dataset types and features; its reference file per feature and language has the exact API. Read the reference file for the feature before writing the code.
+Create one file per dataset.
 
-Shape of a silver streaming table with Auto CDC, in SQL:
+Create `src/bakehouse_pipeline/bronze/sales_transactions_raw.py`:
 
-```sql
-CREATE OR REFRESH STREAMING TABLE orders_silver
-  (CONSTRAINT valid_id EXPECT (order_id IS NOT NULL) ON VIOLATION DROP ROW)
-AS SELECT * FROM STREAM read_kafka(....);
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_transactions_raw")
+def sales_transactions_raw():
+    return spark.read.table("samples.bakehouse.sales_transactions")
 ```
 
-Shape of a gold materialized view, in SQL:
+Create `src/bakehouse_pipeline/bronze/sales_customers_raw.py`:
 
-```sql
-CREATE OR REFRESH MATERIALIZED VIEW orders_daily
-AS SELECT order_date, count(*) AS orders, sum(amount) AS revenue
-   FROM <catalog>.<project>_silver.orders_silver
-   GROUP BY order_date;
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_customers_raw")
+def sales_customers_raw():
+    return spark.read.table("samples.bakehouse.sales_customers")
 ```
 
-Note `CREATE OR REFRESH`, not `CREATE OR REPLACE`. The latter is standard SQL and not valid for SDP datasets.
+Create `src/bakehouse_pipeline/bronze/sales_franchises_raw.py`:
 
-### 3. Add the resource to the bundle
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_franchises_raw")
+def sales_franchises_raw():
+    return spark.read.table("samples.bakehouse.sales_franchises")
+```
+
+Create `src/bakehouse_pipeline/bronze/sales_suppliers_raw.py`:
+
+```python
+from pyspark import pipelines as dp
+
+@dp.materialized_view(name="sales_suppliers_raw")
+def sales_suppliers_raw():
+    return spark.read.table("samples.bakehouse.sales_suppliers")
+```
+
+Create `src/bakehouse_pipeline/silver/transactions_clean.py`:
+
+Group the three same-action quality rules in one `expect_all_or_drop` decorator.
+
+```python
+from pyspark import pipelines as dp
+
+silver_schema = spark.conf.get("silver_schema")
+
+@dp.materialized_view(name=f"{silver_schema}.transactions_clean")
+@dp.expect_all_or_drop({
+    "valid_customer": "customerID IS NOT NULL",
+    "valid_quantity": "quantity > 0",
+    "valid_franchise": "franchiseID IS NOT NULL",
+})
+def transactions_clean():
+    return spark.read.table("sales_transactions_raw")
+```
+
+Create `src/bakehouse_pipeline/silver/customers_clean.py`:
+
+```python
+from pyspark import pipelines as dp
+
+silver_schema = spark.conf.get("silver_schema")
+
+@dp.materialized_view(name=f"{silver_schema}.customers_clean")
+def customers_clean():
+    return spark.read.table("sales_customers_raw")
+```
+
+Create `src/bakehouse_pipeline/silver/franchises_clean.py`:
+
+```python
+from pyspark import pipelines as dp
+
+silver_schema = spark.conf.get("silver_schema")
+
+@dp.materialized_view(name=f"{silver_schema}.franchises_clean")
+def franchises_clean():
+    return spark.read.table("sales_franchises_raw")
+```
+
+Create `src/bakehouse_pipeline/silver/suppliers_clean.py`:
+
+```python
+from pyspark import pipelines as dp
+
+silver_schema = spark.conf.get("silver_schema")
+
+@dp.materialized_view(name=f"{silver_schema}.suppliers_clean")
+def suppliers_clean():
+    return spark.read.table("sales_suppliers_raw")
+```
+
+The default target publishes these bronze materialized views:
+
+```text
+bakehouse_bronze.sales_transactions_raw
+bakehouse_bronze.sales_customers_raw
+bakehouse_bronze.sales_franchises_raw
+bakehouse_bronze.sales_suppliers_raw
+```
+
+The configured silver schema publishes these materialized views:
+
+```text
+bakehouse_silver.transactions_clean
+bakehouse_silver.customers_clean
+bakehouse_silver.franchises_clean
+bakehouse_silver.suppliers_clean
+```
+
+### 3. Add the pipeline resource
+
+Create `resources/bakehouse_e2e_pipeline.pipeline.yml`:
 
 ```yaml
-# resources/<project>.pipeline.yml
 resources:
   pipelines:
-    <project>_medallion:
-      name: ${bundle.name}-medallion
+    bakehouse_e2e_pipeline:
+      name: bakehouse_e2e_pipeline
       catalog: ${var.catalog}
-      schema: ${var.schema_prefix}_bronze
-      serverless: true
+      target: bakehouse_bronze
+      root_path: ../src/bakehouse_pipeline
       libraries:
         - glob:
-            include: ../src/pipelines/**
+            include: ../src/bakehouse_pipeline/**
+      serverless: true
+      continuous: false
+      development: true
+      photon: true
+      channel: current
       configuration:
-        source_path: ${var.source_path}
+        silver_schema: bakehouse_silver
 ```
 
-Targets other than bronze come from fully-qualified dataset names in the source, `${var.catalog}.${var.schema_prefix}_gold.orders_daily`, since the pipeline has one default schema.
+Both paths resolve relative to the YAML file under `resources/`.
+`${var.catalog}` prevents a hardcoded workspace catalog.
+Development mode may prefix the displayed workspace pipeline name, while the resource key `bakehouse_e2e_pipeline` remains the bundle command target.
 
-Declare `source_path` as a variable in `databricks.yml` with a per-target value. A dev pipeline reading the production landing path is the failure this prevents.
+### 4. Deploy and run
 
-### 4. Validate and deploy to dev
+Run from the existing project repository:
 
 ```bash
-databricks bundle validate --strict --target dev --profile <name>
-databricks bundle deploy --target dev --profile <name>
-databricks bundle run <project>_medallion --target dev --profile <name>
-```
+databricks bundle validate --strict --target dev --profile <workspace-profile>
+databricks bundle deploy --target dev --profile <workspace-profile>
 
-Deploy to dev only. Staging and production go through CI/CD, which is a later section not in this seed.
+pipeline_id=$(databricks bundle summary \
+  --target dev \
+  --profile <workspace-profile> \
+  -o json \
+  | jq -er '.resources.pipelines.bakehouse_e2e_pipeline.id')
+
+update_id=$(databricks bundle run bakehouse_e2e_pipeline \
+  --target dev \
+  --profile <workspace-profile> \
+  --no-wait \
+  -o json \
+  | jq -er '.update_id')
+```
 
 ## Verify
 
-```bash
-# Pipeline exists and the last update succeeded
-databricks bundle run <project>_medallion --target dev --profile <name> -o json \
-  | jq -r '.state, .cause'
+Prove the bundle update completed and all eight governed materialized views exist with the `tables get` API command:
 
-# All three layers materialized
-for layer in bronze silver gold; do
-  echo "== $layer"
-  databricks tables list --catalog <catalog> --schema <project>_$layer --profile <name> -o json \
-    | jq -r '.[] | .name'
+```bash
+while :; do
+  update=$(databricks pipelines get-update \
+    "$pipeline_id" \
+    "$update_id" \
+    --profile <workspace-profile> \
+    -o json) || exit 1
+  state=$(jq -er '.update.state' <<<"$update") || exit 1
+  printf 'update=%s state=%s\n' "$update_id" "$state"
+
+  case "$state" in
+    COMPLETED)
+      break
+      ;;
+    FAILED|CANCELED)
+      jq '.update' <<<"$update" >&2
+      exit 1
+      ;;
+    *)
+      sleep 30
+      ;;
+  esac
 done
 
-# Gold has rows, and they came from the source
-databricks api post /api/2.0/sql/statements --profile <name> --json '{
-  "warehouse_id": "<warehouse-id>",
-  "statement": "SELECT count(*) AS rows FROM <catalog>.<project>_gold.<table>",
-  "wait_timeout": "50s"
-}' | jq -r '.result.data_array[0][0]'
+for table in \
+  <catalog>.bakehouse_bronze.sales_transactions_raw \
+  <catalog>.bakehouse_bronze.sales_customers_raw \
+  <catalog>.bakehouse_bronze.sales_franchises_raw \
+  <catalog>.bakehouse_bronze.sales_suppliers_raw \
+  <catalog>.bakehouse_silver.transactions_clean \
+  <catalog>.bakehouse_silver.customers_clean \
+  <catalog>.bakehouse_silver.franchises_clean \
+  <catalog>.bakehouse_silver.suppliers_clean
+do
+  (databricks tables get "$table" --profile <workspace-profile> -o json \
+    | jq -er 'select(.table_type == "MATERIALIZED_VIEW") | .full_name') || exit 1
+done
 ```
 
-Expected: `COMPLETED`, tables listed in all three schemas, and a non-zero row count in gold.
+Expected: the run state is `COMPLETED`, every response has `table_type` equal to `MATERIALIZED_VIEW`, and all eight exact materialized view names print.
+Any other object type fails the check.
 
-Check the expectations actually fired rather than assuming they are wired:
+Use one query to prove every silver materialized view has rows:
 
 ```bash
-databricks api post /api/2.0/sql/statements --profile <name> --json '{
-  "warehouse_id": "<warehouse-id>",
-  "statement": "SELECT explode(from_json(get_json_object(details, \"$.flow_progress.data_quality.expectations\"), \"array<struct<name:string,passed_records:bigint,failed_records:bigint>>\")) AS e FROM event_log(TABLE(<catalog>.<project>_silver.orders_silver)) WHERE event_type = \"flow_progress\"",
-  "wait_timeout": "50s"
-}' | jq -r '.result.data_array'
+statement=$(cat <<'SQL'
+SELECT 'transactions_clean' AS table_name, count(*) AS row_count
+FROM <catalog>.bakehouse_silver.transactions_clean
+UNION ALL
+SELECT 'customers_clean', count(*)
+FROM <catalog>.bakehouse_silver.customers_clean
+UNION ALL
+SELECT 'franchises_clean', count(*)
+FROM <catalog>.bakehouse_silver.franchises_clean
+UNION ALL
+SELECT 'suppliers_clean', count(*)
+FROM <catalog>.bakehouse_silver.suppliers_clean
+SQL
+)
+
+run_sql "$statement" \
+  | jq -e '
+      [.result.data_array[] | {table: .[0], rows: (.[1] | tonumber)}]
+      | select(length == 4 and all(.[]; .rows > 0))'
 ```
 
-Expected: a row per expectation with pass and fail counts. An empty result means the expectations are not attached to the dataset.
+Expected: four rows with `rows` greater than zero.
+
+Prove no invalid transaction rows survived:
+
+```bash
+statement=$(cat <<'SQL'
+SELECT
+  count_if(customerID IS NULL) AS null_customer_ids,
+  count_if(quantity IS NULL OR quantity <= 0) AS invalid_quantities,
+  count_if(franchiseID IS NULL) AS null_franchise_ids
+FROM <catalog>.bakehouse_silver.transactions_clean
+SQL
+)
+
+run_sql "$statement" \
+  | jq -e '
+      .result.data_array[0]
+      | map(tonumber)
+      | select(. == [0, 0, 0])'
+```
+
+Expected: `[0, 0, 0]`.
+
+Prove all expectations emitted numeric counters:
+
+```bash
+statement=$(cat <<SQL
+SELECT
+  expectation.name,
+  expectation.passed_records,
+  expectation.failed_records
+FROM event_log(TABLE(<catalog>.bakehouse_silver.transactions_clean))
+LATERAL VIEW explode(
+  from_json(
+    get_json_object(details, '$.flow_progress.data_quality.expectations'),
+    'array<struct<name:string,passed_records:bigint,failed_records:bigint>>'
+  )
+) exploded AS expectation
+WHERE event_type = 'flow_progress'
+  AND origin.update_id = '$update_id'
+QUALIFY row_number() OVER (
+  PARTITION BY expectation.name
+  ORDER BY timestamp DESC
+) = 1
+ORDER BY expectation.name
+SQL
+)
+
+run_sql "$statement" \
+  | jq -e '
+      [.result.data_array[] | {
+        name: .[0],
+        passed_records: (.[1] | tonumber),
+        failed_records: (.[2] | tonumber)
+      }]
+      | select(
+          map(.name) == ["valid_customer", "valid_franchise", "valid_quantity"]
+          and all(.[]; (.passed_records | type) == "number")
+          and all(.[]; (.failed_records | type) == "number")
+        )'
+```
+
+Expected: `valid_customer`, `valid_franchise`, and `valid_quantity`, each with numeric pass and fail counters.
+An empty result fails the check.
 
 ## Where this fails
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Auth precheck blocked: missing named targets | Brief only has a workspace URL or display name | Collect Databricks account id, workspace id, workspace host, and workspace profile name before Run |
-| Profile `Valid=NO` | Expired OAuth or SP secret | `databricks auth login --host <workspace-host> --profile <workspace-profile>` or rotate the SP secret |
-| Account id or host mismatch on `auth describe` | Profile points at the wrong account or workspace | Re-login against the named host; confirm account id in the account console |
-| `workspace_id` mismatch on `metastores current` | Wrong profile or wrong workspace in the brief | List workspaces and align id, host, and profile |
-| `current-user me` fails with Valid profile | Principal not on the workspace | Workspace admin assigns the user or SP |
-| `Cannot create streaming table from batch query` | `FROM read_files(...)` instead of `FROM STREAM read_files(...)` | Add `STREAM` |
-| `CREATE OR REPLACE` rejected | Not valid for SDP datasets | Use `CREATE OR REFRESH` |
-| `Column not found` at ingest | `schemaHints` disagree with the files | Sample the source with `read_files` and align the hints |
-| Pipeline stuck `INITIALIZING` on serverless | Cold start | Normal, takes a few minutes. Do not kill it. |
-| Gold aggregate never updates when source rows change | Gold is a streaming table, which is append-only | Make it a materialized view with a batch read |
-| Materialized view falls back to full recompute | No serverless, or no Delta row tracking on the source | Serverless plus `delta.enableRowTracking = true` |
-| SCD2 query returns nothing on `START_AT` | Columns are `__START_AT` and `__END_AT`, double underscore | `WHERE __END_AT IS NULL` for current rows |
-| Real error missing from the events output | Reading `.message`, which only says the update failed | Read `error.exceptions[0].message` |
-| `databricks fs ls /Volumes/...` errors | Volume paths still need the `dbfs:` prefix | `databricks fs ls dbfs:/Volumes/...` |
+| Auth precheck is blocked or targets mismatch | Required auth value is missing or the profile reaches another workspace | Apply the auth remediation table and stop until all checks pass |
+| Source inspection returns permission denied | The deployment principal cannot read `samples.bakehouse` | Grant `USE CATALOG`, `USE SCHEMA`, and `SELECT` on the source |
+| Deploy reports a missing catalog or schema | The target catalog, `bakehouse_bronze`, or `bakehouse_silver` does not exist | Create the missing governed namespace before deploying |
+| Source inspection omits a required column | Bakehouse source column spelling drifted | Update expectations only after confirming the replacement column with the human |
+| Pipeline code contains legacy decorators | The source imports the legacy `dlt` module | Migrate to `from pyspark import pipelines as dp` |
+| A batch source fails validation as a stream | The source uses a streaming read | Use materialized views with `spark.read.table` |
+| Pipeline remains `INITIALIZING` for several minutes | Normal serverless cold start | Wait for the update and do not cancel it |
+| Polling reports an idle pipeline before work completes | The check polls top-level pipeline state | Poll the active update or use the blocking bundle run |
+| Expectation query returns no rows | Expectations did not attach or no flow progress event contains metrics | Inspect the update event log and fix the grouped decorator before continuing |
 
 ## Next
 

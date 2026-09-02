@@ -460,11 +460,16 @@ trap 'rm -f "$deployed_dashboard"' EXIT
 
 jq -er '.serialized_dashboard | fromjson' <<<"$draft" >"$deployed_dashboard"
 
-jq -e --slurpfile source src/bakehouse_franchise_performance.lvdash.json '. == $source[0]' "$deployed_dashboard" >/dev/null
+jq -e \
+  --arg catalog "$catalog" \
+  --slurpfile source src/bakehouse_franchise_performance.lvdash.json '
+    all(.datasets[]; .catalog == $catalog and .schema == "bakehouse_gold")
+    and ((.datasets |= map(del(.catalog, .schema))) == $source[0])' \
+  "$deployed_dashboard" >/dev/null
 printf '%s\n' 'deployed_structure_and_theme=passed'
 ```
 
-Expected: the deployed serialization exactly equals the source contract.
+Expected: every deployed dataset has the active catalog and `bakehouse_gold` schema, and removing only those platform-injected fields makes the deployed serialization exactly equal the source contract.
 
 Execute the deployed queries through the same API assertions:
 
@@ -498,7 +503,7 @@ No visual inspection may substitute for these executable checks.
 | Duplicate-dashboard assertion fails | More than one dashboard ends with the configured name or the only match has another ID | Use bundle summary to identify the bundle-owned dashboard, reconcile only dashboards whose ownership is proven, leave unproven suffix matches unchanged, and require the sole suffix match to equal the bundle-summary ID |
 | Publish, draft GET, or published GET returns another display name | Lakeview state is stale or the response was compared with the configured name instead of the effective name | Refresh bundle summary, derive `effective_display_name` again, and require publish, get, and get-published to return that exact value before continuing |
 | Publish fails or the published check fails | The principal cannot publish, the warehouse is wrong, or no published revision exists | Correct permission or warehouse access, republish the positional ID, and repeat both checks |
-| Deployed structure assertion fails | Server serialization or the deployed source differs from the locked contract | Compare the extracted object with the source, correct the source, and redeploy |
+| Deployed structure assertion fails | A deployed dataset has the wrong namespace or another deployed field differs from the locked source contract | Compare the extracted object with the source, correct the source or resource namespace, and redeploy |
 | Deployed dataset assertion fails | Deployed SQL or source values differ from the verified local contract | Stop and reconcile the extracted queries and metric-view data |
 | Bundle deployment reports drift after UI edits | The workspace draft was changed outside the bundle | Treat the committed source as authoritative and redeploy it through the bundle |
 

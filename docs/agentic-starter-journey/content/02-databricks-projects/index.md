@@ -16,6 +16,7 @@ One repo, one bundle, one owning team.
 The project repo and bundle must exist before any pipeline lands in it.
 The third page reads the shared Bakehouse batch source and publishes governed bronze and silver materialized views.
 The fourth page adds governed measures over those silver views and verifies them against raw SQL.
+The fifth page deploys and publishes the Bakehouse franchise-performance dashboard from the governed metric view.
 
 | Order | Page | Skill | Status |
 |---|---|---|---|
@@ -23,6 +24,7 @@ The fourth page adds governed measures over those silver views and verifies them
 | 2 | [Ingestion Pipelines](/docs/02-databricks-projects/ingestion-pipelines/) | `databricks-lakeflow-connect`, `databricks-zerobus-ingest` | Done |
 | 3 | [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/) | `databricks-pipelines` | Done |
 | 4 | [Metric Views](/docs/02-databricks-projects/metric-views/) | `databricks-metric-views` | Done |
+| 5 | [Dashboards](/docs/02-databricks-projects/dashboards/) | `databricks-core`, `databricks-aibi-dashboards`, `databricks-dabs` | Done |
 
 Pages are linked as they are added.
 

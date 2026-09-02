@@ -9,6 +9,7 @@ description: Create, publish, and verify the Bakehouse Franchise Performance das
 An AI/BI dashboard is a native DABs resource backed by a serialized `.lvdash.json` definition.
 This page consumes the successful [Metric Views](/docs/02-databricks-projects/metric-views/) outcome.
 Dataset SQL remains portable by using bare `franchise_sales_metrics` and putting the catalog and schema on the native resource.
+In development mode, validation can prefix the configured display name, so the resource YAML proves the configured name and bundle summary supplies the effective name used by Lakeview APIs.
 
 ## Goal
 
@@ -49,7 +50,6 @@ Test every SQL statement before deployment.
 ## Run
 
 Run every shell block in Run and Verify in the same Bash shell so resolved variables, helper functions, and fail-closed shell options persist.
-With strict mode active, any failed auth check, strict validation, dataset assertion, bundle-summary assertion, publish assertion, draft assertion, published assertion, deployed structure assertion, or deployed dataset assertion stops the workflow.
 
 ### 0. Verify auth and active-target inputs
 
@@ -183,7 +183,6 @@ assert_kpis() {
       .result.data_array[0] | map(tonumber)
       | .[0] == 66471
       and .[1] == 3333
-      and .[2] > 0
       and .[2] == 19.943294329432945
       and ((.[0] - (.[1] * .[2])) > -0.01)
       and ((.[0] - (.[1] * .[2])) < 0.01)
@@ -233,7 +232,6 @@ assert_products() {
 
 assert_all_datasets() {
   local dashboard_file=$1 sql
-  set -o pipefail
 
   sql=$(dataset_sql "$dashboard_file" ds_kpis) || return
   run_sql "$sql" | assert_kpis || return
@@ -336,11 +334,13 @@ summary=$(
 )
 
 jq -e \
-  --arg catalog "$catalog" '
+  --arg catalog "$catalog" \
+  --arg warehouse_id "$warehouse_id" '
     .resources.dashboards.bakehouse_franchise_performance
     | .id != null
     and (.id | tostring | length > 0)
     and (.url | type == "string" and length > 0)
+    and .warehouse_id == $warehouse_id
     and .dataset_catalog == $catalog
     and .dataset_schema == "bakehouse_gold"' \
   <<<"$summary" >/dev/null
@@ -461,61 +461,107 @@ trap 'rm -f "$deployed_dashboard"' EXIT
 jq -er '.serialized_dashboard | fromjson' <<<"$draft" >"$deployed_dashboard"
 
 jq -e '
-  ([.datasets[].name] == [
-    "ds_kpis",
-    "ds_sales_trend",
-    "ds_franchises",
-    "ds_products"
+  ([.datasets[] | {name, displayName}] == [
+    {"name":"ds_kpis","displayName":"Franchise performance KPIs"},
+    {"name":"ds_sales_trend","displayName":"Daily sales trend"},
+    {"name":"ds_franchises","displayName":"Top franchises"},
+    {"name":"ds_products","displayName":"Top products"}
   ])
-  and (.datasets | length == 4)
   and (.pages | length == 1)
   and (.pages[0].name == "overview")
+  and (.pages[0].displayName == "Overview")
   and (.pages[0].pageType == "PAGE_TYPE_CANVAS")
   and (.pages[0].layoutVersion == "GRID_V1")
   and (.pages[0].layout | length == 8)
   and (
     [
-      .pages[0].layout[].widget
-      | select(.spec != null)
+      .pages[0].layout[]
+      | select(.widget.multilineTextboxSpec != null)
       | {
-          title: .spec.frame.title,
-          type: .spec.widgetType,
-          version: .spec.version
+          name: .widget.name,
+          lines: .widget.multilineTextboxSpec.lines,
+          position
         }
     ] == [
-      {"title":"Total Sales","type":"counter","version":2},
-      {"title":"Order Count","type":"counter","version":2},
-      {"title":"Average Order Value","type":"counter","version":2},
-      {"title":"Daily Sales Trend","type":"line","version":3},
-      {"title":"Top Franchises","type":"bar","version":3},
-      {"title":"Top Products","type":"bar","version":3}
+      {"name":"dashboard-title","lines":["# Bakehouse Franchise Performance"],"position":{"x":0,"y":0,"width":12,"height":1}},
+      {"name":"dashboard-subtitle","lines":["Daily sales, order volume, and product performance across the Bakehouse franchise network."],"position":{"x":0,"y":1,"width":12,"height":1}}
     ]
   )
   and (
     [
-      .pages[0].layout[].widget
-      | select(.spec != null)
+      .pages[0].layout[]
+      | select(.widget.spec != null)
       | {
-          name,
-          dataset: .queries[0].query.datasetName,
-          fields: [.queries[0].query.fields[].name],
-          encodings: (
-            .spec.encodings
-            | [
-                .value.fieldName?,
-                .x.fieldName?,
-                .y.fieldName?
-              ]
-            | map(select(. != null))
-          )
+          name: .widget.name,
+          title: .widget.spec.frame.title,
+          type: .widget.spec.widgetType,
+          version: .widget.spec.version,
+          dataset: .widget.queries[0].query.datasetName,
+          fields: .widget.queries[0].query.fields,
+          encodings: .widget.spec.encodings,
+          position
         }
     ] == [
-      {"name":"total-sales-kpi","dataset":"ds_kpis","fields":["total_sales"],"encodings":["total_sales"]},
-      {"name":"order-count-kpi","dataset":"ds_kpis","fields":["order_count"],"encodings":["order_count"]},
-      {"name":"average-order-value-kpi","dataset":"ds_kpis","fields":["avg_order_value"],"encodings":["avg_order_value"]},
-      {"name":"daily-sales-trend","dataset":"ds_sales_trend","fields":["sales_date","total_sales"],"encodings":["sales_date","total_sales"]},
-      {"name":"top-franchises","dataset":"ds_franchises","fields":["franchise","total_sales"],"encodings":["total_sales","franchise"]},
-      {"name":"top-products","dataset":"ds_products","fields":["product","total_sales"],"encodings":["total_sales","product"]}
+      {
+        "name":"total-sales-kpi",
+        "title":"Total Sales",
+        "type":"counter",
+        "version":2,
+        "dataset":"ds_kpis",
+        "fields":[{"name":"total_sales","expression":"`total_sales`"}],
+        "encodings":{"value":{"fieldName":"total_sales","displayName":"Total Sales","format":{"type":"number-plain","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}}},
+        "position":{"x":0,"y":2,"width":4,"height":3}
+      },
+      {
+        "name":"order-count-kpi",
+        "title":"Order Count",
+        "type":"counter",
+        "version":2,
+        "dataset":"ds_kpis",
+        "fields":[{"name":"order_count","expression":"`order_count`"}],
+        "encodings":{"value":{"fieldName":"order_count","displayName":"Order Count","format":{"type":"number-plain","decimalPlaces":{"type":"exact","places":0}}}},
+        "position":{"x":4,"y":2,"width":4,"height":3}
+      },
+      {
+        "name":"average-order-value-kpi",
+        "title":"Average Order Value",
+        "type":"counter",
+        "version":2,
+        "dataset":"ds_kpis",
+        "fields":[{"name":"avg_order_value","expression":"`avg_order_value`"}],
+        "encodings":{"value":{"fieldName":"avg_order_value","displayName":"Average Order Value","format":{"type":"number-plain","decimalPlaces":{"type":"exact","places":2}}}},
+        "position":{"x":8,"y":2,"width":4,"height":3}
+      },
+      {
+        "name":"daily-sales-trend",
+        "title":"Daily Sales Trend",
+        "type":"line",
+        "version":3,
+        "dataset":"ds_sales_trend",
+        "fields":[{"name":"sales_date","expression":"`sales_date`"},{"name":"total_sales","expression":"`total_sales`"}],
+        "encodings":{"x":{"fieldName":"sales_date","displayName":"Sales Date","scale":{"type":"temporal"}},"y":{"fieldName":"total_sales","displayName":"Total Sales","scale":{"type":"quantitative","domainMin":0},"format":{"type":"number","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}}},
+        "position":{"x":0,"y":5,"width":12,"height":6}
+      },
+      {
+        "name":"top-franchises",
+        "title":"Top Franchises",
+        "type":"bar",
+        "version":3,
+        "dataset":"ds_franchises",
+        "fields":[{"name":"franchise","expression":"`franchise`"},{"name":"total_sales","expression":"`total_sales`"}],
+        "encodings":{"x":{"fieldName":"total_sales","displayName":"Total Sales","scale":{"type":"quantitative","domainMin":0},"format":{"type":"number","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}},"y":{"fieldName":"franchise","displayName":"Franchise","scale":{"type":"categorical"}}},
+        "position":{"x":0,"y":11,"width":6,"height":6}
+      },
+      {
+        "name":"top-products",
+        "title":"Top Products",
+        "type":"bar",
+        "version":3,
+        "dataset":"ds_products",
+        "fields":[{"name":"product","expression":"`product`"},{"name":"total_sales","expression":"`total_sales`"}],
+        "encodings":{"x":{"fieldName":"total_sales","displayName":"Total Sales","scale":{"type":"quantitative","domainMin":0},"format":{"type":"number","abbreviation":"compact","decimalPlaces":{"type":"max","places":2}}},"y":{"fieldName":"product","displayName":"Product","scale":{"type":"categorical"}}},
+        "position":{"x":6,"y":11,"width":6,"height":6}
+      }
     ]
   )
   and ([.datasets[].queryLines | join("") | contains("FROM franchise_sales_metrics")] | all)
@@ -575,10 +621,12 @@ No visual inspection may substitute for these executable checks.
 | A widget has no selected fields | A query field name differs from its encoding field name | Restore the exact locked field bindings |
 | Strict bundle validation fails | The native resource is malformed or its source path is wrong | Restore the exact resource and the `../src` path |
 | Configured display-name assertion fails | The source YAML does not contain the exact `display_name: Bakehouse Franchise Performance` line | Restore the exact configured line in `resources/bakehouse_franchise_performance.dashboard.yml` and rerun its `rg -Fxq` assertion |
+| Validation reports an unexpected display-name prefix | The active development preset differs from the expected target configuration | Inspect the validation output and target preset, keep the source YAML unprefixed, and use bundle summary as the authority for the effective Lakeview API name |
 | Effective display-name extraction fails | The deployed development name is empty or does not retain the configured name as its suffix | Inspect the target presets and require an effective name ending with `Bakehouse Franchise Performance` |
 | Dashboard ID extraction fails | Bundle summary lacks the exact resource key | Inspect deployment output and restore `bakehouse_franchise_performance` |
 | Dashboard identity-retention assertion fails | Deployment replaced an existing bundle-managed dashboard with a new ID | Stop and reconcile bundle state so updates retain the pre-existing dashboard ID |
-| Duplicate-dashboard assertion fails | More than one dashboard ends with the configured name or the only match has another ID | Remove or reconcile orphaned duplicates, then require the sole suffix match to equal the bundle-summary ID |
+| Duplicate-dashboard assertion fails | More than one dashboard ends with the configured name or the only match has another ID | Use bundle summary to identify the bundle-owned dashboard, reconcile only dashboards whose ownership is proven, leave unproven suffix matches unchanged, and require the sole suffix match to equal the bundle-summary ID |
+| Publish, draft GET, or published GET returns another display name | Lakeview state is stale or the response was compared with the configured name instead of the effective name | Refresh bundle summary, derive `effective_display_name` again, and require publish, get, and get-published to return that exact value before continuing |
 | Publish fails or the published check fails | The principal cannot publish, the warehouse is wrong, or no published revision exists | Correct permission or warehouse access, republish the positional ID, and repeat both checks |
 | Deployed structure assertion fails | Server serialization or the deployed source differs from the locked contract | Compare the extracted object with the source, correct the source, and redeploy |
 | Deployed dataset assertion fails | Deployed SQL or source values differ from the verified local contract | Stop and reconcile the extracted queries and metric-view data |

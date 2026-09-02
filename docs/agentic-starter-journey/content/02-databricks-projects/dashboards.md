@@ -264,7 +264,8 @@ Parse the source and execute all four exact queries before deployment:
 ```bash
 dashboard_file=src/bakehouse_franchise_performance.lvdash.json
 jq -e '.' "$dashboard_file" >/dev/null
-assert_all_datasets "$dashboard_file"
+assert_all_datasets "$dashboard_file" >/dev/null
+printf '%s\n' 'local_datasets=passed'
 ```
 
 Expected: JSON parsing and all source dataset assertions succeed.
@@ -325,7 +326,7 @@ jq -e \
     and (.url | type == "string" and length > 0)
     and .dataset_catalog == $catalog
     and .dataset_schema == "bakehouse_gold"' \
-  <<<"$summary"
+  <<<"$summary" >/dev/null
 
 dashboard_id=$(
   jq -er '
@@ -348,8 +349,23 @@ effective_display_name=$(
     <<<"$summary"
 )
 
+dashboards=$(
+  databricks lakeview list \
+    --profile "$DATABRICKS_CONFIG_PROFILE" \
+    -o json
+)
+
+jq -e \
+  --arg configured_display_name "$configured_display_name" \
+  --arg dashboard_id "$dashboard_id" '
+    [.[] | select((.display_name? // "") | endswith($configured_display_name))]
+    | length == 1
+    and .[0].dashboard_id == $dashboard_id' \
+  <<<"$dashboards" >/dev/null
+
 printf 'configured_display_name=%s\neffective_display_name=%s\ndashboard_id=%s\ndashboard_url=%s\n' \
   "$configured_display_name" "$effective_display_name" "$dashboard_id" "$dashboard_url"
+printf '%s\n' 'bundle_summary_and_duplicate=passed'
 
 published_after_publish=$(
   databricks lakeview publish "$dashboard_id" \
@@ -364,10 +380,13 @@ jq -e \
     .display_name == $effective_display_name
     and .warehouse_id == $warehouse_id
     and (.revision_create_time | type == "string" and length > 0)' \
-  <<<"$published_after_publish"
+  <<<"$published_after_publish" >/dev/null
+
+printf '%s\n' 'publish=passed'
 ```
 
-Expected: deployment succeeds, summary returns one nonempty dashboard ID and URL, the effective name is nonempty and ends with `Bakehouse Franchise Performance`, and publish returns that effective name, the warehouse, and a revision timestamp.
+Expected: deployment succeeds, summary returns one nonempty dashboard ID and URL, the effective name is nonempty and ends with `Bakehouse Franchise Performance`, exactly one matching dashboard has the bundle-summary ID, and publish returns that effective name, the warehouse, and a revision timestamp.
+The list assertion detects duplicate or orphaned dashboards.
 
 ## Verify
 
@@ -394,7 +413,7 @@ jq -e \
     and .display_name == $effective_display_name
     and .warehouse_id == $warehouse_id
     and (.serialized_dashboard | type == "string" and length > 0)' \
-  <<<"$draft"
+  <<<"$draft" >/dev/null
 
 jq -e \
   --arg effective_display_name "$effective_display_name" \
@@ -402,7 +421,9 @@ jq -e \
     .display_name == $effective_display_name
     and .warehouse_id == $warehouse_id
     and (.revision_create_time | type == "string" and length > 0)' \
-  <<<"$published"
+  <<<"$published" >/dev/null
+
+printf '%s\n' 'draft_and_published=passed'
 ```
 
 Expected: bundle summary proves the requested namespace, draft metadata and serialized content use the effective deployed name, and the published object has that name, the warehouse, and a revision timestamp.
@@ -498,7 +519,9 @@ jq -e '
   and (.uiSettings.theme.widgetHeaderAlignment == "LEFT")
   and (.uiSettings.theme.fontFamily == "Inter")
   and (.uiSettings.theme.widgetCornerRadius == 8)
-' "$deployed_dashboard"
+' "$deployed_dashboard" >/dev/null
+
+printf '%s\n' 'deployed_structure_and_theme=passed'
 ```
 
 Expected: the deployed object has exactly four datasets, eight layout widgets, six exact business widgets, exact versions and bindings, bare metric-view references, no filters, no Genie link, and the complete light and dark theme.
@@ -506,7 +529,8 @@ Expected: the deployed object has exactly four datasets, eight layout widgets, s
 Execute the deployed queries through the same API assertions:
 
 ```bash
-assert_all_datasets "$deployed_dashboard"
+assert_all_datasets "$deployed_dashboard" >/dev/null
+printf '%s\n' 'deployed_datasets=passed'
 ```
 
 Expected: all four deployed datasets satisfy the same row and value assertions as the source.
@@ -529,6 +553,7 @@ No visual inspection may substitute for these executable checks.
 | Configured display-name assertion fails | The source YAML does not contain the exact `display_name: Bakehouse Franchise Performance` line | Restore the exact configured line in `resources/bakehouse_franchise_performance.dashboard.yml` and rerun its `rg -Fxq` assertion |
 | Effective display-name extraction fails | The deployed development name is empty or does not retain the configured name as its suffix | Inspect the target presets and require an effective name ending with `Bakehouse Franchise Performance` |
 | Dashboard ID extraction fails | Bundle summary lacks the exact resource key | Inspect deployment output and restore `bakehouse_franchise_performance` |
+| Duplicate-dashboard assertion fails | More than one dashboard ends with the configured name or the only match has another ID | Remove or reconcile orphaned duplicates, then require the sole suffix match to equal the bundle-summary ID |
 | Publish fails or the published check fails | The principal cannot publish, the warehouse is wrong, or no published revision exists | Correct permission or warehouse access, republish the positional ID, and repeat both checks |
 | Deployed structure assertion fails | Server serialization or the deployed source differs from the locked contract | Compare the extracted object with the source, correct the source, and redeploy |
 | Deployed dataset assertion fails | Deployed SQL or source values differ from the verified local contract | Stop and reconcile the extracted queries and metric-view data |

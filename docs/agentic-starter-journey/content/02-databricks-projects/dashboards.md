@@ -325,7 +325,8 @@ pre_existing_dashboard_id=$(
 
 databricks bundle deploy \
   --target dev \
-  --profile "$DATABRICKS_CONFIG_PROFILE"
+  --profile "$DATABRICKS_CONFIG_PROFILE" \
+  --auto-approve
 
 summary=$(
   databricks bundle summary \

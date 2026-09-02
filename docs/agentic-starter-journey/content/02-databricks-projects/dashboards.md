@@ -746,23 +746,19 @@ resources:
 Strictly validate the local configuration:
 
 ```bash
-validated_bundle=$(
-  databricks bundle validate \
-    --strict \
-    --target dev \
-    --profile "$DATABRICKS_CONFIG_PROFILE" \
-    -o json
-)
+databricks bundle validate \
+  --strict \
+  --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE" \
+  -o json >/dev/null
 
-configured_display_name=$(
-  jq -er '
-    .resources.dashboards.bakehouse_franchise_performance.display_name
-    | select(. == "Bakehouse Franchise Performance")' \
-    <<<"$validated_bundle"
-)
+resource_file=resources/bakehouse_franchise_performance.dashboard.yml
+rg -Fxq '      display_name: Bakehouse Franchise Performance' "$resource_file"
+configured_display_name='Bakehouse Franchise Performance'
 ```
 
-Expected: strict validation succeeds and the configured dashboard resource display name is exactly `Bakehouse Franchise Performance`.
+Expected: strict validation succeeds and the source YAML contains the exact configured display name `Bakehouse Franchise Performance`.
+Development presets are already applied in validation and summary output, so only the source YAML proves the unprefixed configured value.
 
 ### 4. Deploy and publish
 
@@ -989,7 +985,7 @@ No visual inspection may substitute for these executable checks.
 | A widget is invalid | A counter is not version 2 or a line or bar is not version 3 | Restore the exact widget versions |
 | A widget has no selected fields | A query field name differs from its encoding field name | Restore the exact locked field bindings |
 | Strict bundle validation fails | The native resource is malformed or its source path is wrong | Restore the exact resource and the `../src` path |
-| Configured display-name assertion fails | The source-controlled resource name differs from `Bakehouse Franchise Performance` | Restore the exact configured `display_name` and strictly validate again |
+| Configured display-name assertion fails | The source YAML does not contain the exact `display_name: Bakehouse Franchise Performance` line | Restore the exact configured line in `resources/bakehouse_franchise_performance.dashboard.yml` and rerun its `rg -Fxq` assertion |
 | Effective display-name extraction fails | The deployed development name is empty or does not retain the configured name as its suffix | Inspect the target presets and require an effective name ending with `Bakehouse Franchise Performance` |
 | Dashboard ID extraction fails | Bundle summary lacks the exact resource key | Inspect deployment output and restore `bakehouse_franchise_performance` |
 | Publish fails or the published check fails | The principal cannot publish, the warehouse is wrong, or no published revision exists | Correct permission or warehouse access, republish the positional ID, and repeat both checks |

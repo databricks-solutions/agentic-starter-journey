@@ -22,7 +22,7 @@ Add a project-defined batch pipeline to the existing bundle, run one new update,
 
 ## Skill
 
-Invoke these verified skills in order:
+Verified skills for this workflow:
 
 1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core)
 2. [`databricks-pipelines`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-pipelines)
@@ -45,14 +45,15 @@ Invoke these verified skills in order:
 | `<silver_dataset>` names | Human-provided | Choose one unique silver materialized view name per transformed dataset |
 | `<quality_rule_name>` values | Human-provided | Choose one unique name per quality rule |
 | `<quality_rule_sql>` values | Human-provided | Provide each SQL boolean expression |
-| Quality rule actions | Human-provided | Choose the action for each rule, such as drop |
+| Quality rule actions | Human-provided | Choose `warn`, `drop`, or `fail` for each rule |
 | `catalog` | Agent-derived | Read `.variables.catalog.value` from strict bundle validation |
 | `schema_prefix` | Agent-derived | Read `.variables.schema_prefix.value` from strict bundle validation |
 | `warehouse_id` | Agent-derived | Read `.variables.warehouse_id.value` from strict bundle validation |
-| Source schema | Agent-derived | Parse and cross-check each source mapping against its source FQN |
+| Source name components | Human-provided | Provide the catalog, schema, and table that must exactly reconstruct each source FQN |
 | Bronze schema | Agent-derived | Use `${schema_prefix}_bronze` |
 | Silver schema | Agent-derived | Use `${schema_prefix}_silver` |
 | `SOURCE_SPECS_JSON` | Human-provided | Encode source FQNs, parsed name parts, and selected columns in the required JSON shape |
+| `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
 | File layout | Agent-derived | Put each focused dataset file under `src/<pipeline_key>/` and the resource under `resources/` |
 
 ## Run
@@ -70,6 +71,7 @@ set -euo pipefail
 : "${DATABRICKS_CONFIG_PROFILE:?}"
 : "${PROJECT_PATH:?}"
 : "${SOURCE_SPECS_JSON:?}"
+: "${QUALITY_RULES_JSON:?}"
 cd "$PROJECT_PATH"
 auth=$(databricks auth describe --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
 jq -e \
@@ -89,8 +91,6 @@ catalog=$(jq -er '.variables.catalog.value' <<<"$bundle")
 schema_prefix=$(jq -er '.variables.schema_prefix.value' <<<"$bundle")
 warehouse_id=$(jq -er '.variables.warehouse_id.value' <<<"$bundle")
 ```
-
-Invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
 
 ### 2. Inspect every batch source
 
@@ -149,6 +149,7 @@ jq -e '
     and (.catalog | type == "string" and length > 0)
     and (.schema | type == "string" and length > 0)
     and (.table | type == "string" and length > 0)
+    and (.fqn == ([.catalog, .schema, .table] | join(".")))
     and (.required_columns | type == "array" and length > 0)
   )' >/dev/null <<<"$SOURCE_SPECS_JSON"
 source_count=$(jq 'length' <<<"$SOURCE_SPECS_JSON")
@@ -190,6 +191,38 @@ printf 'source_precheck=passed sources=%s\n' "$source_count"
 
 Expected: `source_precheck=passed` with the configured positive source count.
 
+Define `QUALITY_RULES_JSON` with this human-provided shape.
+
+```json
+[
+  {
+    "name": "<quality_rule_name>",
+    "sql": "<quality_rule_sql>",
+    "action": "warn"
+  }
+]
+```
+
+Validate every rule and reject any action other than `warn`, `drop`, or `fail`.
+
+```bash
+jq -e '
+  type == "array"
+  and length > 0
+  and all(.[];
+    (.name | type == "string" and length > 0)
+    and (.sql | type == "string" and length > 0)
+    and (.action == "warn" or .action == "drop" or .action == "fail")
+  )
+  and ([.[].name] | length == (unique | length))
+  ' >/dev/null <<<"$QUALITY_RULES_JSON"
+printf 'quality_rule_precheck=passed rules=%s\n' \
+  "$(jq 'length' <<<"$QUALITY_RULES_JSON")"
+```
+
+Expected: `quality_rule_precheck=passed` with the configured positive rule count.
+Only after both prechecks pass, invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
+
 ### 3. Write focused dataset files
 
 Create one bronze file for each source under `src/<pipeline_key>/bronze/`.
@@ -203,19 +236,27 @@ def bronze_dataset():
 ```
 
 Create one silver file for each transformed dataset under `src/<pipeline_key>/silver/`.
+Group rules by action and use the exact native decorator for that action.
 
 ```python
 from pyspark import pipelines as dp
 
 @dp.materialized_view(name="<silver_schema>.<silver_dataset>")
+@dp.expect_all({
+    "<warn_rule_name>": "<warn_rule_sql>",
+})
 @dp.expect_all_or_drop({
-    "<quality_rule_name>": "<quality_rule_sql>",
+    "<drop_rule_name>": "<drop_rule_sql>",
+})
+@dp.expect_all_or_fail({
+    "<fail_rule_name>": "<fail_rule_sql>",
 })
 def silver_dataset():
     return spark.read.table("<bronze_dataset>")
 ```
 
-Put rules with the same action in one grouped decorator.
+Map `warn` to `expect_all`, `drop` to `expect_all_or_drop`, and `fail` to `expect_all_or_fail`.
+Omit a decorator when that action group is empty.
 Give every dataset one focused file.
 
 ### 4. Add the native pipeline resource
@@ -411,6 +452,8 @@ expectations=<configured-rule-count>
 |---|---|---|
 | Authentication check fails before validation | The profile targets another account, workspace, or host | Correct the named values or reauthenticate the intended profile before continuing |
 | Source precheck reports missing required columns | The human source mapping does not match the live table | Correct the mapping or approve revised dataset logic before authoring |
+| Source precheck fails before inspection | A source FQN does not exactly equal its catalog, schema, and table components | Correct the inconsistent source contract before continuing |
+| Quality rule precheck fails | A rule is incomplete, duplicated, or uses an action other than `warn`, `drop`, or `fail` | Correct the rule contract before authoring |
 | Source inspection or deployment returns permission denied | The deployment principal lacks source, schema, or warehouse privileges | Grant the minimum required read, write, and warehouse permissions |
 | Pipeline source imports `dlt` | The project uses the legacy pipeline module | Replace it with `from pyspark import pipelines as dp` |
 | A batch source is read as a stream | The dataset uses a streaming read for a batch input | Use a materialized view with `spark.read.table` |

@@ -49,10 +49,10 @@ Invoke these verified skills in order:
 | `catalog` | Agent-derived | Read `.variables.catalog.value` from strict bundle validation |
 | `schema_prefix` | Agent-derived | Read `.variables.schema_prefix.value` from strict bundle validation |
 | `warehouse_id` | Agent-derived | Read `.variables.warehouse_id.value` from strict bundle validation |
-| Source name components | Agent-derived | Parse the catalog, schema, and table from each validated three-part source FQN |
+| Source catalog, schema, and table components | Agent-derived | Parse all three fields from each validated human-provided source FQN |
 | Bronze schema | Agent-derived | Use `${schema_prefix}_bronze` |
 | Silver schema | Agent-derived | Use `${schema_prefix}_silver` |
-| `SOURCE_SPECS_JSON` | Human-provided | Encode only source FQNs and selected columns in the required JSON shape |
+| `SOURCE_SPECS_JSON` | Agent-derived | Add redundant catalog, schema, and table fields parsed from the human-provided FQNs, then cross-check them before use |
 | `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
 | File layout | Agent-derived | Put each focused dataset file under `src/<pipeline_key>/` and the resource under `resources/` |
 
@@ -124,18 +124,21 @@ run_sql() {
 }
 ```
 
-Define `SOURCE_SPECS_JSON` with this human-provided shape.
+After the human provides each source FQN and its selected columns, populate `SOURCE_SPECS_JSON` with the parsed catalog, schema, and table fields.
 
 ```json
 [
   {
     "fqn": "<catalog>.<source_schema>.<source_table>",
+    "catalog": "<catalog>",
+    "schema": "<source_schema>",
+    "table": "<source_table>",
     "required_columns": ["<required_column_one>", "<required_column_two>"]
   }
 ]
 ```
 
-Validate every mapping and stop before authoring when a required column is absent.
+Validate every redundant field against the human-provided FQN and stop before authoring when a required column is absent.
 
 ```bash
 jq -e '
@@ -143,6 +146,10 @@ jq -e '
   and length > 0
   and all(.[];
     (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$"))
+    and (.catalog | type == "string" and length > 0)
+    and (.schema | type == "string" and length > 0)
+    and (.table | type == "string" and length > 0)
+    and (.fqn == ([.catalog, .schema, .table] | join(".")))
     and (.required_columns | type == "array" and length > 0)
   )' >/dev/null <<<"$SOURCE_SPECS_JSON"
 source_count=$(jq 'length' <<<"$SOURCE_SPECS_JSON")
@@ -440,7 +447,7 @@ expectations=<configured-rule-count>
 |---|---|---|
 | Authentication check fails before validation | The profile targets another account, workspace, or host | Correct the named values or reauthenticate the intended profile before continuing |
 | Source precheck reports missing required columns | The human source mapping does not match the live table | Correct the mapping or approve revised dataset logic before authoring |
-| Source precheck fails before inspection | A source FQN is not exactly three nonempty dot-separated components | Correct the source FQN before continuing |
+| Source precheck fails before inspection | A source FQN is not three nonempty components or a redundant field differs from the parsed FQN | Correct the derived source specification before continuing |
 | Quality rule precheck fails | A rule is incomplete, duplicated, or uses an action other than `warn`, `drop`, or `fail` | Correct the rule contract before authoring |
 | Source inspection or deployment returns permission denied | The deployment principal lacks source, schema, or warehouse privileges | Grant the minimum required read, write, and warehouse permissions |
 | Pipeline source imports `dlt` | The project uses the legacy pipeline module | Replace it with `from pyspark import pipelines as dp` |

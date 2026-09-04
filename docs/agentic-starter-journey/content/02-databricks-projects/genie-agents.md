@@ -426,11 +426,8 @@ assert not any(is_keyword(token, "WITH") for token in tokens), "WITH is forbidde
 mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY"}
 assert not any(token[0] == WORD and token[1].upper() in mutations for token in tokens), "mutation or side-effecting SQL is forbidden"
 
-for index, token in enumerate(tokens[:-1]):
-    assert token[1] != "(" or not (
-        is_keyword(tokens[index + 1], "SELECT")
-        or is_keyword(tokens[index + 1], "WITH")
-    ), "nested subquery is forbidden"
+query_starters = {"SELECT", "WITH", "TABLE", "VALUES", "FROM"}
+assert not any(token[2] > 0 and token[0] == WORD and token[1].upper() in query_starters for token in tokens), "nested query is forbidden"
 
 terminators = {
     "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY",

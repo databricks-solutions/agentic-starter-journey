@@ -91,7 +91,13 @@ bundle=$(databricks bundle validate --strict --target dev \
   --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
 catalog=$(jq -er '.variables.catalog.value' <<<"$bundle")
 warehouse_id=$(jq -er '.variables.warehouse_id.value' <<<"$bundle")
-dataset_schema='<metric_view_schema>'
+metric_view_fqn='<metric_view_fqn>'
+IFS=. read -r metric_catalog dataset_schema expected_bare_metric_view metric_extra \
+  <<<"$metric_view_fqn"
+test "$metric_catalog" = "$catalog"
+test -n "$dataset_schema"
+test -n "$expected_bare_metric_view"
+test -z "$metric_extra"
 dashboard_key='<dashboard_key>'
 configured_display_name='<dashboard_display_name>'
 dashboard_source="src/$dashboard_key.lvdash.json"
@@ -330,7 +336,7 @@ jq -e '
     "widgetCornerRadius",
     "widgetHeaderAlignment"
   ]' "$dashboard_source" >/dev/null
-python3 - "$dashboard_source" <<'PY'
+python3 - "$dashboard_source" "$expected_bare_metric_view" <<'PY'
 import json
 import re
 import sys
@@ -406,9 +412,9 @@ terminators = {
     "UNION",
     "WHERE",
 }
-dashboard = json.load(open(sys.argv[1]))
-for dataset in dashboard["datasets"]:
-    sql = "".join(dataset["queryLines"])
+expected = sys.argv[2]
+
+def validate_relations(sql, dataset_name):
     parsed = tokens(sql)
     indexed_words = "\n".join(
         f"{index}:{token[1]}"
@@ -420,27 +426,29 @@ for dataset in dashboard["datasets"]:
         indexed_words,
     )
     assert len(from_tokens) == 1, {
-        "dataset": dataset["name"],
+        "dataset": dataset_name,
         "from_count": len(from_tokens),
     }
     from_index = int(from_tokens[0])
     join_tokens = re.findall(r"(?im)^(\d+):JOIN$", indexed_words)
     for relation_index in [from_index, *map(int, join_tokens)]:
-        assert relation_index + 1 < len(parsed), dataset["name"]
+        assert relation_index + 1 < len(parsed), dataset_name
         table_kind, table_token = parsed[relation_index + 1]
         assert table_kind in {"word", "identifier"}, {
-            "dataset": dataset["name"],
+            "dataset": dataset_name,
             "table_token": table_token,
         }
-        assert "." not in table_token.replace("``", ""), {
-            "dataset": dataset["name"],
-            "table_token": table_token,
+        normalized = table_token[1:-1].replace("``", "`") if table_kind == "identifier" else table_token
+        assert normalized == expected, {
+            "dataset": dataset_name,
+            "expected": expected,
+            "table_token": normalized,
         }
         assert (
             relation_index + 2 == len(parsed)
             or parsed[relation_index + 2][1] != "."
         ), {
-            "dataset": dataset["name"],
+            "dataset": dataset_name,
             "table_token": table_token,
         }
     suffix = parsed[from_index + 2 :]
@@ -449,14 +457,27 @@ for dataset in dashboard["datasets"]:
         or suffix == [("symbol", ";")]
         or (suffix[0][0] == "word" and suffix[0][1].upper() in terminators)
     ), {
-        "dataset": dataset["name"],
+        "dataset": dataset_name,
         "invalid_suffix": suffix[0],
     }
+
+validate_relations(f"SELECT 1 FROM {expected}", "fixture-correct-bare-table")
+try:
+    validate_relations(f"SELECT 1 FROM wrong_{expected}", "fixture-wrong-bare-table")
+except AssertionError:
+    pass
+else:
+    raise AssertionError("wrong bare table fixture passed")
+
+dashboard = json.load(open(sys.argv[1]))
+for dataset in dashboard["datasets"]:
+    validate_relations("".join(dataset["queryLines"]), dataset["name"])
 print("bare_from_tokens=passed")
 PY
 ```
 
-Expected: the source parses, every query fragment has a separator, page and widget versions match the contract, the theme is complete, and each dataset has exactly one bare `FROM` table token with no qualified or invalid suffix.
+Expected: the source parses, every query fragment has a separator, page and widget versions match the contract, the theme is complete, and every `FROM` or `JOIN` relation exactly equals the selected bare metric-view name.
+The wrong-bare-table fixture must fail before the authored datasets are accepted.
 
 ### 2. Capture canonical source baselines
 

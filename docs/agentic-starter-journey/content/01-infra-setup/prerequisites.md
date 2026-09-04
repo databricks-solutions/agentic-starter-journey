@@ -23,8 +23,8 @@ This page is the bootstrap auth check.
 
 ## Skill
 
-No product skill is invoked on this check page.
-Install [ai-platform-kit](https://github.com/databricks-solutions/ai-platform-kit) and [databricks-agent-skills](https://github.com/databricks/databricks-agent-skills#installation) before continuing.
+None.
+This is a check page, not a skill invocation.
 
 ## Inputs
 
@@ -34,46 +34,42 @@ Install [ai-platform-kit](https://github.com/databricks-solutions/ai-platform-ki
 | Databricks account id | Human | Account console, top-right user menu. Live identity must match this id before any later page runs. |
 | Named Databricks account profile | Human | Named Databricks CLI profile that can call account APIs (`databricks account workspaces list`). |
 | Target cloud | Human | `aws`, `azure`, or `gcp`. Drives which cloud CLI check to run. |
-| AWS account id and named profile | Human | Required for AWS. Use the 12-digit account id and the exact AWS CLI profile passed with `--profile`. |
-| Azure expected subscription id and active CLI context | Human | Required for Azure. Name the expected subscription id, then select it in the active Azure CLI context with `az account set --subscription <azure-subscription-id>`. |
-| GCP project id and named configuration | Human | Required for GCP. Name the expected project id and the exact gcloud configuration passed with `--configuration`. |
+| Cloud account id | Human | AWS: 12-digit account id from IAM. Azure: subscription id. GCP: project id. Live cloud CLI identity must match this id. |
+| Named cloud profile | Human | Named profile for `aws` (`--profile`), `az` (`AZURE_CONFIG_DIR` or default subscription), or `gcloud` (`--configuration` or active account). |
 | Agent harness | You derive | `claude`, `codex`, `cursor`, `copilot`, `gemini`, `windsurf`, `opencode`, `kiro`, or `all`. Drives the ai-platform-kit `--agent` flag. |
 | Skill directory | You derive | Directory this harness reads. Claude: `~/.claude/skills/`. Cursor: `~/.cursor/skills/`. Also check project `.claude/skills/` / `.cursor/skills/`. |
 
 ## Run
 
-Refuse to continue if the human has not named `<databricks-account-id>`, `<account-profile>`, and the target cloud's expected identifier and auth context.
-AWS requires `<aws-account-id>` and `<aws-profile>`.
-Azure requires `<azure-subscription-id>` and an active Azure CLI context.
-GCP requires `<gcp-project-id>` and `<gcp-configuration>`.
+Refuse to continue if the human has not named `<databricks-account-id>`, `<cloud-account-id>`, `<account-profile>`, and `<cloud-profile>`.
 Ambiguous targets alone (workspace URL, bucket name, display name) are insufficient.
 
 ```bash
 # 0. Live identity must match human-named account ids (hard stop on mismatch)
 databricks auth profiles -o json \
-  | jq -r --arg p "<account-profile>" '.profiles[] | select(.name==$p) | "\(.name)\tValid=\(.valid)\taccount_id=\(.account_id // "unknown")"'
+  | jq -r --arg p "<account-profile>" '.[] | select(.name==$p) | "\(.name)\tValid=\(.valid)\taccount_id=\(.account_id // "unknown")"'
 
-LIVE_DB_ACCOUNT=$(databricks auth profiles -o json \
-  | jq -er --arg p "<account-profile>" '
-      [.profiles[] | select(.name == $p and .valid == true)]
-      | select(length == 1)
-      | .[0].account_id
-      | select(type == "string" and length > 0)')
+LIVE_DB_ACCOUNT=$(databricks account workspaces list --profile <account-profile> -o json \
+  | jq -r 'if length > 0 then .[0].account_id else empty end')
+# If the account has no workspaces yet, read account_id from auth profiles or account metastores list.
+test -n "$LIVE_DB_ACCOUNT" || LIVE_DB_ACCOUNT=$(databricks account metastores list --profile <account-profile> -o json \
+  | jq -r '.[0].account_id // empty')
 test "$LIVE_DB_ACCOUNT" = "<databricks-account-id>" \
   || { echo "BLOCKED: Databricks account id mismatch (live=$LIVE_DB_ACCOUNT expected=<databricks-account-id>)"; exit 1; }
-databricks account workspaces list --profile <account-profile> -o json >/dev/null
 
 # AWS
-aws sts get-caller-identity --profile <aws-profile> --query Account --output text
-test "$(aws sts get-caller-identity --profile <aws-profile> --query Account --output text)" = "<aws-account-id>" \
+aws sts get-caller-identity --profile <cloud-profile> --query Account --output text
+test "$(aws sts get-caller-identity --profile <cloud-profile> --query Account --output text)" = "<cloud-account-id>" \
   || { echo "BLOCKED: AWS account id mismatch"; exit 1; }
 
 # Azure (when target cloud is azure)
-test "$(az account show --query id -o tsv)" = "<azure-subscription-id>" \
+az account show --query id -o tsv
+test "$(az account show --query id -o tsv)" = "<cloud-account-id>" \
   || { echo "BLOCKED: Azure subscription id mismatch"; exit 1; }
 
 # GCP (when target cloud is gcp)
-test "$(gcloud config get-value project --configuration <gcp-configuration>)" = "<gcp-project-id>" \
+gcloud config get-value project
+test "$(gcloud config get-value project)" = "<cloud-account-id>" \
   || { echo "BLOCKED: GCP project id mismatch"; exit 1; }
 
 # 1. Databricks CLI installed and recent enough
@@ -100,9 +96,9 @@ find ~/.claude/skills ~/.cursor/skills .claude/skills .cursor/skills \
   -name SKILL.md \( -path '*platform-provisioning*' -o -path '*unity-catalog-setup*' \) 2>/dev/null
 
 # 4. Cloud CLI for the target cloud (run only the block for target cloud)
-aws sts get-caller-identity --profile <aws-profile>   # AWS
-az account show                                       # Azure: active context, note tenant + subscription
-gcloud auth list --configuration <gcp-configuration> # GCP
+aws sts get-caller-identity --profile <cloud-profile>   # AWS
+az account show                                          # Azure: note tenant + subscription
+gcloud auth list                                         # GCP
 terraform version                                        # >= 1.9.0, all clouds
 ```
 
@@ -117,10 +113,10 @@ Do not invoke skills, Terraform, or Crew.
 | Databricks profile missing | `databricks auth login --host <account-host> --profile <account-profile>` |
 | Databricks profile `Valid=NO` | Refresh OAuth or M2M credentials for `<account-profile>`; rerun `databricks auth login` or update the profile secret |
 | Databricks account id mismatch | Confirm the account console id; fix `<account-profile>` or the human-provided `<databricks-account-id>` |
-| AWS STS expired or invalid | `aws sso login --profile <aws-profile>` or refresh the named profile session |
-| AWS account id mismatch | `aws sts get-caller-identity --profile <aws-profile>`; fix the profile or `<aws-account-id>` |
-| Azure not logged in or wrong active subscription | `az login --tenant <tenant-id>` then `az account set --subscription <azure-subscription-id>` |
-| GCP not logged in or wrong project | `gcloud auth login --configuration <gcp-configuration>` then `gcloud config set project <gcp-project-id> --configuration <gcp-configuration>` |
+| AWS STS expired or invalid | `aws sso login --profile <cloud-profile>` or refresh the named profile session |
+| AWS account id mismatch | `aws sts get-caller-identity --profile <cloud-profile>`; fix profile or `<cloud-account-id>` |
+| Azure not logged in or wrong subscription | `az login --tenant <tenant-id>` then `az account set --subscription <cloud-account-id>` |
+| GCP not logged in or wrong project | `gcloud auth login` then `gcloud config set project <cloud-account-id>` |
 
 ## Verify
 
@@ -131,22 +127,20 @@ databricks auth profiles
 Expected: the account-admin profile row shows `Valid` = `YES` and the account host for that cloud.
 
 ```bash
-databricks auth profiles -o json \
-  | jq -er --arg p "<account-profile>" '
-      [.profiles[] | select(.name == $p and .valid == true)]
-      | select(length == 1)
-      | .[0].account_id'
+databricks account workspaces list --profile <account-profile> -o json \
+  | jq -r 'if length > 0 then .[0].account_id else "no workspaces yet" end'
 ```
 
-Expected: prints `<databricks-account-id>`.
+Expected: prints `<databricks-account-id>`, or `no workspaces yet` when the account is empty.
+In the empty case, `databricks auth profiles` must still show the same account id for `<account-profile>`.
 
 ```bash
-aws sts get-caller-identity --profile <aws-profile> --query Account --output text         # AWS
-az account show --query id -o tsv                                                       # Azure active context
-gcloud config get-value project --configuration <gcp-configuration>                     # GCP
+aws sts get-caller-identity --profile <cloud-profile> --query Account --output text   # AWS
+az account show --query id -o tsv                                                     # Azure
+gcloud config get-value project                                                     # GCP
 ```
 
-Expected: prints `<aws-account-id>`, `<azure-subscription-id>`, or `<gcp-project-id>` for the target cloud.
+Expected: prints `<cloud-account-id>` for the target cloud.
 A mismatch with the human-named id is a hard failure; stop with the remediation table.
 
 ```bash
@@ -187,9 +181,9 @@ AWS profile  not set         ask the user which named profile to use
 | Symptom | Cause | Fix |
 |---|---|---|
 | `BLOCKED: Databricks account id mismatch` | Named id does not match live profile or account API | Confirm account console id; rerun `databricks auth login --host <account-host> --profile <account-profile>` or fix M2M profile credentials |
-| `BLOCKED: AWS account id mismatch` or `ExpiredToken` | Wrong AWS profile or expired STS session | `aws sso login --profile <aws-profile>`; confirm with `aws sts get-caller-identity --profile <aws-profile>` |
-| `BLOCKED: Azure subscription id mismatch` | The active Azure CLI context targets the wrong subscription or tenant | `az login --tenant <tenant-id>` then `az account set --subscription <azure-subscription-id>` |
-| `BLOCKED: GCP project id mismatch` | The named gcloud configuration targets the wrong project | `gcloud auth login --configuration <gcp-configuration>` then `gcloud config set project <gcp-project-id> --configuration <gcp-configuration>` |
+| `BLOCKED: AWS account id mismatch` or `ExpiredToken` | Wrong AWS profile or expired STS session | `aws sso login --profile <cloud-profile>`; confirm with `aws sts get-caller-identity --profile <cloud-profile>` |
+| `BLOCKED: Azure subscription id mismatch` | Wrong `az` subscription or tenant | `az login --tenant <tenant-id>` then `az account set --subscription <cloud-account-id>` |
+| `BLOCKED: GCP project id mismatch` | Wrong active gcloud project | `gcloud auth login` then `gcloud config set project <cloud-account-id>` |
 | Account profile `Valid=NO` | Expired OAuth, stale M2M secret, wrong host, or missing account admin | `databricks auth login --host <account-host> --profile <account-profile>` or update the SP OAuth secret; confirm Account admin role |
 | `databricks: command not found` | CLI not installed | Install per the Databricks CLI docs |
 | `auth describe` prints "Unable to load OAuth Config" but account APIs work | Describe quirk on some M2M profiles | Trust `auth profiles` + `account workspaces list`, not describe alone |
@@ -202,3 +196,5 @@ AWS profile  not set         ask the user which named profile to use
 ## Next
 
 - **Do next:** [Workspaces](/docs/01-infra-setup/workspaces/)
+- **Install:** [ai-platform-kit](https://github.com/databricks-solutions/ai-platform-kit)
+- **Install:** [databricks-agent-skills](https://github.com/databricks/databricks-agent-skills#installation)

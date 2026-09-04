@@ -54,9 +54,18 @@ Invoke these verified skills in order:
 | Silver schema | Agent-derived | Use `${schema_prefix}_silver` |
 | `SOURCE_SPECS_JSON` | Agent-derived | Add redundant catalog, schema, and table fields parsed from the human-provided FQNs, then cross-check them before use |
 | `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
+| `OUTPUT_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, authored materialized-view name, and complete deployed FQN |
+| `EXPECTATION_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, materialized-view name, rule name, SQL expression, and action used for authoring |
 | File layout | Agent-derived | Put each focused dataset file under `src/<pipeline_key>/` and the resource under `resources/` |
 
 ## Run
+
+Start one persistent Bash session, then run every remaining Run and Verify block in that session.
+This preserves strict options, variables, arrays, and functions and avoids reserved-name behavior from another shell.
+
+```bash
+bash
+```
 
 ### 1. Resolve authentication and the bundle target
 
@@ -65,6 +74,8 @@ The identity check fails before any file or live resource change when the profil
 
 ```bash
 set -euo pipefail
+: "${BASH_VERSION:?Start the required persistent Bash session}"
+persistent_bash_pid=$$
 : "${DATABRICKS_ACCOUNT_ID:?}"
 : "${DATABRICKS_WORKSPACE_ID:?}"
 : "${DATABRICKS_HOST:?}"
@@ -72,6 +83,8 @@ set -euo pipefail
 : "${PROJECT_PATH:?}"
 : "${SOURCE_SPECS_JSON:?}"
 : "${QUALITY_RULES_JSON:?}"
+: "${OUTPUT_MANIFEST_JSON:?}"
+: "${EXPECTATION_MANIFEST_JSON:?}"
 cd "$PROJECT_PATH"
 auth=$(databricks auth describe --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
 jq -e \
@@ -216,6 +229,51 @@ printf 'quality_rule_precheck=passed rules=%s\n' \
 ```
 
 Expected: `quality_rule_precheck=passed` with the configured positive rule count.
+
+Derive complete authoring manifests before writing any focused Python file.
+
+```json
+[
+  {"file": "bronze/<bronze_dataset>.py", "name": "<bronze_dataset>", "fqn": "<catalog>.<bronze_schema>.<bronze_dataset>"},
+  {"file": "silver/<silver_dataset>.py", "name": "<silver_schema>.<silver_dataset>", "fqn": "<catalog>.<silver_schema>.<silver_dataset>"}
+]
+```
+
+```json
+[
+  {"file": "silver/<silver_dataset>.py", "materialized_view": "<silver_schema>.<silver_dataset>", "name": "<quality_rule_name>", "sql": "<quality_rule_sql>", "action": "drop"}
+]
+```
+
+Validate both manifests and require their complete expectation set to equal the human-provided quality rules.
+
+```bash
+jq -en \
+  --argjson outputs "$OUTPUT_MANIFEST_JSON" \
+  --argjson expectations "$EXPECTATION_MANIFEST_JSON" \
+  --argjson quality "$QUALITY_RULES_JSON" '
+  ($outputs | length > 0
+    and all(.[];
+      (.file | type == "string" and endswith(".py"))
+      and (.name | type == "string" and length > 0)
+      and (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$")))
+    and ([.[].file] | length == (unique | length))
+    and ([.[].name] | length == (unique | length))
+    and ([.[].fqn] | length == (unique | length)))
+  and ($expectations | length > 0
+    and all(.[];
+      (.file | type == "string" and endswith(".py"))
+      and (.materialized_view | type == "string" and length > 0)
+      and (.name | type == "string" and length > 0)
+      and (.sql | type == "string" and length > 0)
+      and (.action | IN("warn", "drop", "fail")))
+    and ([.[] | [.file, .materialized_view, .name]] | length == (unique | length)))
+  and ($quality | sort_by(.name))
+    == ($expectations | map({name, sql, action}) | sort_by(.name))
+' >/dev/null
+```
+
+Expected: both manifests are nonempty and unique, and no quality rule is missing or added.
 Only after both prechecks pass, invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
 
 ### 3. Write focused dataset files
@@ -253,6 +311,77 @@ def silver_dataset():
 Map `warn` to `expect_all`, `drop` to `expect_all_or_drop`, and `fail` to `expect_all_or_fail`.
 Omit a decorator when that action group is empty.
 Give every dataset one focused file.
+
+Statically parse every focused Python file and require exact equality with both authoring manifests before deployment.
+Create `src/verify_pipeline_authoring.py`:
+
+```text
+import ast, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+catalog, bronze_schema = sys.argv[2:4]
+expected_outputs = json.loads(sys.argv[4])
+expected_rules = json.loads(sys.argv[5])
+actions = {"expect_all": "warn", "expect_all_or_drop": "drop", "expect_all_or_fail": "fail"}
+actual_outputs, actual_rules = [], []
+for path in sorted(root.rglob("*.py")):
+    relative = str(path.relative_to(root))
+    tree = ast.parse(path.read_text(), filename=str(path))
+    functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for function in functions:
+        calls = [item for item in function.decorator_list if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)]
+        views = [item for item in calls if item.func.attr == "materialized_view"]
+        expectations = [item for item in calls if item.func.attr in actions]
+        if not views:
+            assert not expectations, f"expectation without materialized view: {relative}:{function.name}"
+            continue
+        assert len(views) == 1
+        values = [item.value for item in views[0].keywords if item.arg == "name"]
+        assert len(values) == 1
+        view = ast.literal_eval(values[0])
+        assert isinstance(view, str) and view
+        fqn = f"{catalog}.{view}" if "." in view else f"{catalog}.{bronze_schema}.{view}"
+        actual_outputs.append({"file": relative, "name": view, "fqn": fqn})
+        for decorator in expectations:
+            assert len(decorator.args) == 1 and not decorator.keywords
+            action, rules = actions[decorator.func.attr], ast.literal_eval(decorator.args[0])
+            assert isinstance(rules, dict) and rules
+            for name, sql in rules.items():
+                actual_rules.append({"file": relative, "materialized_view": view, "name": name, "sql": sql, "action": action})
+
+def canonical(items):
+    return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+
+def require_exact(expected, actual, label):
+    assert canonical(expected) == canonical(actual), {"contract": label, "expected": canonical(expected), "actual": canonical(actual)}
+
+require_exact(expected_outputs, actual_outputs, "materialized views")
+require_exact(expected_rules, actual_rules, "expectations")
+for expected, omitted, label in [
+    (expected_outputs, actual_outputs[:-1], "omitted materialized view fixture"),
+    (expected_rules, actual_rules[:-1], "omitted expectation fixture"),
+]:
+    try:
+        require_exact(expected, omitted, label)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"{label} passed")
+print("authoring_manifests=passed omission_fixtures=passed")
+```
+
+Run the parser before deployment:
+
+```bash
+python3 src/verify_pipeline_authoring.py \
+  "src/<pipeline_key>" \
+  "$catalog" \
+  "${schema_prefix}_bronze" \
+  "$OUTPUT_MANIFEST_JSON" \
+  "$EXPECTATION_MANIFEST_JSON"
+```
+
+Expected: `authoring_manifests=passed omission_fixtures=passed`.
+Any omitted or extra materialized view, expectation rule, action, SQL expression, file, name, or FQN fails before deployment.
 
 ### 4. Add the native pipeline resource
 
@@ -327,6 +456,7 @@ Poll the exact update returned by the bundle run.
 Only `COMPLETED` passes.
 
 ```bash
+test "$persistent_bash_pid" = "$$"
 while :
 do
   update=$(databricks pipelines get-update "$pipeline_id" "$update_id" \
@@ -341,20 +471,33 @@ do
 done
 ```
 
-List every configured output, every silver output with expectations, and every configured quality rule.
+Derive every runtime output and expected rule from the exact authoring manifests that passed before deployment.
 Then verify object types, nonempty outputs, and numeric expectation counters from the exact update.
 
 ```bash
-output_fqns=(
-  "<catalog>.<bronze_schema>.<bronze_dataset>"
-  "<catalog>.<silver_schema>.<silver_dataset>"
+mapfile -t output_fqns < <(
+  jq -r '.[].fqn' <<<"$OUTPUT_MANIFEST_JSON" | LC_ALL=C sort
 )
-expectation_silver_fqns=(
-  "<catalog>.<silver_schema>.<silver_dataset_with_expectations>"
+mapfile -t expectation_view_names < <(
+  jq -r '.[].materialized_view' <<<"$EXPECTATION_MANIFEST_JSON" \
+    | LC_ALL=C sort -u
 )
-quality_rule_names=(
-  "<quality_rule_name>"
+expectation_silver_fqns=()
+for expectation_view_name in "${expectation_view_names[@]}"
+do
+  expectation_silver_fqns+=("$(
+    jq -er --arg name "$expectation_view_name" '
+      [.[] | select(.name == $name)]
+      | select(length == 1)
+      | .[0].fqn
+    ' <<<"$OUTPUT_MANIFEST_JSON"
+  )")
+done
+mapfile -t quality_rule_names < <(
+  jq -r '.[].name' <<<"$EXPECTATION_MANIFEST_JSON" | LC_ALL=C sort
 )
+test "${#output_fqns[@]}" -eq "$(jq 'length' <<<"$OUTPUT_MANIFEST_JSON")"
+test "${#quality_rule_names[@]}" -eq "$(jq 'length' <<<"$EXPECTATION_MANIFEST_JSON")"
 materialized_view_count=0
 nonempty_output_count=0
 for output_fqn in "${output_fqns[@]}"
@@ -449,6 +592,7 @@ expectations=<configured-rule-count>
 | Source precheck reports missing required columns | The human source mapping does not match the live table | Correct the mapping or approve revised dataset logic before authoring |
 | Source precheck fails before inspection | A source FQN is not three nonempty components or a redundant field differs from the parsed FQN | Correct the derived source specification before continuing |
 | Quality rule precheck fails | A rule is incomplete, duplicated, or uses an action other than `warn`, `drop`, or `fail` | Correct the rule contract before authoring |
+| Authoring manifest validation fails | A materialized view, expectation, action, expression, file, name, or FQN is omitted, extra, or changed | Reconcile the complete manifests and focused Python files before deployment |
 | Source inspection or deployment returns permission denied | The deployment principal lacks source, schema, or warehouse privileges | Grant the minimum required read, write, and warehouse permissions |
 | Pipeline source imports `dlt` | The project uses the legacy pipeline module | Replace it with `from pyspark import pipelines as dp` |
 | A batch source is read as a stream | The dataset uses a streaming read for a batch input | Use a materialized view with `spark.read.table` |

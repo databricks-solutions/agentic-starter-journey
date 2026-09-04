@@ -52,9 +52,6 @@ Ask for every human-sourced value in one message.
 | Cloud region | Human | Must support the chosen topology. Check feature-region-support for Serverless workspaces when topology is serverless. |
 | Topology | Human | `serverless` or `classic` (table above) |
 | Databricks account ID | Human | Account console, top-right user menu |
-| AWS account id and named profile | Human | Required for AWS. The profile is passed with `--profile`, and its live 12-digit account id must match the expected id. |
-| Azure expected subscription id and active CLI context | Human | Required for Azure. Select the expected subscription in the active context with `az account set --subscription <azure-subscription-id>`. |
-| GCP project id and named configuration | Human | Required for GCP. The configuration is passed with `--configuration`, and its live project must match the expected id. |
 | Environment strategy | Human | One workspace, or dev / staging / prod |
 | Purpose | Human | POC or production |
 | Existing network? | Human | Classic only: new network, or an existing one (VPC/VNet ID, two private subnets in different AZs when the region has AZs, security group IDs). Omit `zones` on PIP/NAT in non-zonal regions (example: Azure `westcentralus`). |
@@ -90,10 +87,7 @@ Refuse to continue on mismatch.
 
 ### 0. Auth precheck
 
-Refuse if the human did not name the Databricks account id, Databricks account CLI profile, target cloud, and that cloud's expected identifier and auth context.
-AWS requires an account id and named profile.
-Azure requires an expected subscription id and active Azure CLI context.
-GCP requires a project id and named configuration.
+Refuse if the human did not name all of these: Databricks account id, Databricks account CLI profile, target cloud (`aws`, `azure`, or `gcp`), cloud account id, cloud CLI profile.
 Do not invoke the skill until every named target is present.
 
 Run live checks:
@@ -101,16 +95,12 @@ Run live checks:
 ```bash
 databricks auth profiles
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
-test "$(aws sts get-caller-identity --profile <aws-profile> --query Account --output text)" = "<aws-account-id>" \
-  || { echo "BLOCKED: AWS account id mismatch"; exit 1; }
-test "$(az account show --query id -o tsv)" = "<azure-subscription-id>" \
-  || { echo "BLOCKED: Azure subscription id mismatch"; exit 1; }
-test "$(gcloud config get-value project --configuration <gcp-configuration>)" = "<gcp-project-id>" \
-  || { echo "BLOCKED: GCP project id mismatch"; exit 1; }
+aws sts get-caller-identity --profile <aws-profile>     # AWS: Account must equal named cloud account id
+az account show --profile <azure-profile>                  # Azure: tenant + subscription must match named ids
+gcloud auth list                                           # GCP: active account must match named project
 ```
 
-Run only the block for the target cloud.
-Each comparison must pass before skill invocation.
+Compare the live cloud identity to the human-named cloud account id.
 When the account API returns an account id, compare it to the human-named Databricks account id.
 
 On any failure, print **blocked: auth preflight failed**, name the failing check, give the human these remediations, and **stop**.
@@ -121,17 +111,16 @@ Do not run Terraform.
 |---|---|
 | Account profile missing or `Valid=NO` | `databricks auth login --host <account-host> --profile <account-profile>` or fix M2M SP secret and Account admin role |
 | `account workspaces list` fails | Confirm Account admin on the SP; regenerate OAuth secret (AWS) |
-| AWS CLI not authenticated or account id mismatch | `aws sso login --profile <aws-profile>` and select the profile matching `<aws-account-id>` |
-| Azure CLI not authenticated or subscription id mismatch | `az login --tenant <tenant>` then `az account set --subscription <azure-subscription-id>` |
-| GCP CLI not authenticated or project id mismatch | `gcloud auth login --configuration <gcp-configuration>` then set `<gcp-project-id>` in that configuration |
+| Cloud CLI not authenticated | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
+| Cloud account id mismatch | Pick the profile whose account id matches the human-named cloud account id |
 | Databricks account id mismatch | Fix the account profile or the human-named account id before continuing |
 
 ### 1. Pre-flight
 
 ```bash
 aws sts get-caller-identity --profile <aws-profile>     # AWS
-az account show                                          # Azure: confirm active tenant + subscription
-gcloud auth list --configuration <gcp-configuration>     # GCP
+az account show                                          # Azure: confirm tenant + subscription
+gcloud auth list                                         # GCP
 env | grep -i DATABRICKS          # stale DATABRICKS_HOST or DATABRICKS_TOKEN breaks provider auth
 databricks auth profiles          # never echoes secrets
 terraform version                 # >= 1.9.0
@@ -222,9 +211,9 @@ databricks current-user me --profile <workspace-profile> -o json | jq -r '.userN
 Compute verification after the workspace is up:
 
 - Serverless topology: serverless SQL warehouse path only (CREATE/INSERT/SELECT/DROP on a UC table once catalogs exist).
-  Skip classic clusters.
+Skip classic clusters.
 - Classic topology: classic cluster and serverless SQL as in `databricks-deployment-verification`.
-  Start the classic cluster early; cold start is 10 to 15 minutes.
+Start the classic cluster early; cold start is 10 to 15 minutes.
 
 On Azure, workspace admin for the creator is often automatic via Azure AD. `databricks_mws_permission_assignment` does not work on Azure; do not use it there.
 
@@ -232,9 +221,9 @@ On Azure, workspace admin for the creator is often automatic via Azure AD. `data
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **blocked: auth preflight failed** before Run | Missing Databricks target or cloud-specific expected id and auth context | Ask for the AWS profile, active Azure context, or gcloud configuration required by the selected cloud; rerun ### 0 |
+| **blocked: auth preflight failed** before Run | Missing named account id, account profile, cloud account id, or cloud profile | Ask the human for every required target; rerun ### 0 |
 | Account profile `Valid=NO` or account list fails | Expired login or wrong SP secret | `databricks auth login --host <account-host> --profile <account-profile>` or fix M2M and Account admin role |
-| Cloud identity check fails | Wrong AWS profile, active Azure subscription, or gcloud configuration | Reauthenticate the selected context and make its live identifier match the human-provided expected id |
+| Cloud STS / `az account show` fails or account id mismatch | Wrong or expired cloud profile | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login`; pick the profile that matches the named cloud account id |
 | Skill invoked despite red precheck | Agent skipped ### 0 | Always run ### 0 first; stop on any failure |
 | `400 BAD_REQUEST: Failed to get oauth access token` (AWS) | SP is not an account admin, or the secret is wrong | Confirm the Account admin role on the Roles tab, regenerate the secret |
 | Provider hits the wrong host | `DATABRICKS_HOST` or `DATABRICKS_TOKEN` set in the shell | `unset` both, re-run |

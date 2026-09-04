@@ -60,6 +60,13 @@ The DAG uses the fixed downstream task key `validate_output`.
 
 ## Run
 
+Start one persistent Bash session, then run every remaining Run and Verify block in that session.
+This preserves strict options, variables, arrays, and functions and avoids reserved-name behavior from another shell.
+
+```bash
+bash
+```
+
 ### 1. Add the single-task pipeline job
 
 Create one bundle resource file under `resources/`.
@@ -126,6 +133,8 @@ Set `PIPELINE_OUTPUT_FQN` to the exact FQN embedded in `src/<validation_sql_file
 
 ```bash
 set -euo pipefail
+: "${BASH_VERSION:?Start the required persistent Bash session}"
+persistent_bash_pid=$$
 : "${DATABRICKS_ACCOUNT_ID:?}"
 : "${DATABRICKS_WORKSPACE_ID:?}"
 : "${DATABRICKS_HOST:?}"
@@ -147,6 +156,9 @@ test -z "$output_extra" || {
   printf 'PIPELINE_OUTPUT_FQN must be a three-part name\n' >&2
   exit 1
 }
+databricks() {
+  command databricks "$@" --profile "$DATABRICKS_CONFIG_PROFILE"
+}
 cd "$PROJECT_PATH"
 test "$(pwd -P)" = "$(cd "$PROJECT_PATH" && pwd -P)"
 test -f "$PROJECT_PATH/databricks.yml"
@@ -166,8 +178,7 @@ databricks auth profiles -o json \
   | jq -e --arg profile "$DATABRICKS_CONFIG_PROFILE" '
       [.profiles[] | select(.name == $profile and .valid == true)]
       | length == 1' >/dev/null
-auth=$(databricks auth describe \
-  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+auth=$(databricks auth describe -o json)
 jq -e \
   --arg account "$DATABRICKS_ACCOUNT_ID" \
   --arg workspace "$DATABRICKS_WORKSPACE_ID" \
@@ -186,15 +197,12 @@ jq -e \
         and .account_id == $account
         and .workspace_id == $workspace
       )' >/dev/null <<<"$auth"
-bundle=$(databricks bundle validate --strict --target "$BUNDLE_TARGET" \
-  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+bundle=$(databricks bundle validate --strict --target "$BUNDLE_TARGET" -o json)
 warehouse_id=$(jq -er '
   .variables.warehouse_id.value
   | select(type == "string" and length > 0)' <<<"$bundle")
-databricks bundle deploy --target "$BUNDLE_TARGET" \
-  --profile "$DATABRICKS_CONFIG_PROFILE" --auto-approve
-summary=$(databricks bundle summary --target "$BUNDLE_TARGET" \
-  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+databricks bundle deploy --target "$BUNDLE_TARGET" --auto-approve
+summary=$(databricks bundle summary --target "$BUNDLE_TARGET" -o json)
 pipeline_id=$(jq -er --arg key "<pipeline_key>" \
   '.resources.pipelines[$key].id | select(type == "string" and length > 0)' \
   <<<"$summary")
@@ -209,8 +217,7 @@ Expected: strict validation targets `dev`, authentication matches the exact acco
 ### 5. Assert both deployed job graphs before triggering
 
 ```bash
-single_settings=$(databricks jobs get "$single_job_id" \
-  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+single_settings=$(databricks jobs get "$single_job_id" -o json)
 jq -e \
   --arg pipeline_id "$pipeline_id" '
     .settings as $settings
@@ -224,8 +231,7 @@ jq -e \
       and ($settings.tasks[0].pipeline_task.full_refresh == false)' \
   >/dev/null <<<"$single_settings"
 
-dag_settings=$(databricks jobs get "$dag_job_id" \
-  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+dag_settings=$(databricks jobs get "$dag_job_id" -o json)
 jq -e \
   --arg pipeline_id "$pipeline_id" \
   --arg warehouse_id "$warehouse_id" '
@@ -259,19 +265,20 @@ Expected: the exact one-task graph and exact two-task dependency graph pass befo
 Define fail-closed helpers for idle baseline capture, bounded pagination, exact job polling, update correlation, and output verification.
 
 ```bash
+test "$persistent_bash_pid" = "$$"
 capture_idle_baseline() {
   local response update_id update state
   while :
   do
     response=$(databricks pipelines list-updates "$pipeline_id" \
-      --max-results 1 --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+      --max-results 1 -o json) || return
     update_id=$(jq -er '
       .updates
       | select(length == 1)
       | .[0].update_id
       | select(type == "string" and length > 0)' <<<"$response") || return
     update=$(databricks pipelines get-update "$pipeline_id" "$update_id" \
-      --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+      -o json) || return
     state=$(jq -er '.update.state' <<<"$update") || return
     case "$state" in
       COMPLETED|FAILED|CANCELED) printf '%s\n' "$update_id"; return 0 ;;
@@ -290,11 +297,11 @@ collect_updates_through_baseline() {
     then
       response=$(databricks pipelines list-updates "$pipeline_id" \
         --max-results 100 --page-token "$page_token" \
-        --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+        -o json) || return
     else
       response=$(databricks pipelines list-updates "$pipeline_id" \
         --max-results 100 \
-        --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+        -o json) || return
     fi
     jq -c '.updates[]' >>"$updates_file" <<<"$response"
     if jq -e --arg baseline "$baseline" \
@@ -317,8 +324,7 @@ poll_job() {
   local run lifecycle
   while :
   do
-    run=$(databricks jobs get-run "$run_id" \
-      --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+    run=$(databricks jobs get-run "$run_id" -o json) || return
     lifecycle=$(jq -er '.state.life_cycle_state' <<<"$run") || return
     case "$lifecycle" in
       TERMINATED)
@@ -371,7 +377,7 @@ assert_exact_job_task_update() {
       | select(length == 1)
       | .[0].update_id' "$updates_file") || return
   update=$(databricks pipelines get-update "$pipeline_id" "$update_id" \
-    --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+    -o json) || return
   jq -e '
     .update.state == "COMPLETED"
     and .update.cause == "JOB_TASK"' >/dev/null <<<"$update" || return
@@ -382,7 +388,6 @@ assert_output_nonempty() {
   local response
   response=$(
     databricks api post /api/2.0/sql/statements \
-      --profile "$DATABRICKS_CONFIG_PROFILE" \
       --json "$(jq -n \
         --arg warehouse_id "$warehouse_id" \
         --arg statement "SELECT count(*) FROM $PIPELINE_OUTPUT_FQN" '
@@ -412,7 +417,7 @@ Run and fully verify the single-task job before capturing the DAG baseline.
 ```bash
 single_baseline=$(capture_idle_baseline)
 single_run_id=$(databricks jobs run-now "$single_job_id" \
-  --profile "$DATABRICKS_CONFIG_PROFILE" --no-wait -o json \
+  --no-wait -o json \
   | jq -er '.run_id | tostring')
 run_id=$single_run_id
 run=$(poll_job)
@@ -443,7 +448,7 @@ Only after that sequence passes, run and verify the DAG.
 ```bash
 dag_baseline=$(capture_idle_baseline)
 dag_run_id=$(databricks jobs run-now "$dag_job_id" \
-  --profile "$DATABRICKS_CONFIG_PROFILE" --no-wait -o json \
+  --no-wait -o json \
   | jq -er '.run_id | tostring')
 run_id=$dag_run_id
 run=$(poll_job)

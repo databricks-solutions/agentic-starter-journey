@@ -25,7 +25,7 @@ A storage credential plus a **read-only** external location so Databricks can li
 - Permission for the skill to create the cloud identity (IAM role / Access Connector / service account) in the customer's cloud account.
 - Caller has `CREATE STORAGE CREDENTIAL` and `CREATE EXTERNAL LOCATION` on the metastore (metastore admin has both by default).
 - Azure: User Access Administrator or Owner on the RG/subscription so Access Connector role assignments succeed.
-  Contributor alone fails with `AuthorizationFailed` on `roleAssignments/write`.
+Contributor alone fails with `AuthorizationFailed` on `roleAssignments/write`.
 
 ## Skill
 
@@ -53,9 +53,6 @@ Do not flip the location to read-write here.
 |---|---|---|
 | Storage path | Human | Exact URI: `s3://bucket/prefix/`, `abfss://container@account.dfs.core.windows.net/prefix/`, or `gs://bucket/prefix/`. Ask for the full path, not just the bucket name. |
 | Which groups need read access | Human | Account-level groups. Grant `READ FILES` only. If the human omits groups (cold-start / eval brief), fall back to `account users`, grant `READ FILES` only, and log that the human did not name a group. |
-| AWS account id and named profile | Human | Required for AWS. The named profile's live account id must match the expected 12-digit id. |
-| Azure expected subscription id and active CLI context | Human | Required for Azure. Select the expected subscription with `az account set --subscription <azure-subscription-id>`. |
-| GCP project id and named configuration | Human | Required for GCP. The named configuration's live project must match the expected id. |
 | Cloud IAM identity | Skill-derived unless reusing | Default: skill creates the IAM role (AWS), Access Connector (Azure), or service account (GCP) with **read** permissions on the path. Only ask for an existing ARN/identity when reusing. |
 | Credential and location names | You derive | Prefer a ≤3-option naming pick when a human is present. If the brief already supplies names, or no human picker is available (cold-start Crew), use `<prefix>_cred_<purpose>` / `<prefix>_ext_<purpose>` (underscores) and record the choice. Do not stall waiting for a pick. |
 
@@ -69,10 +66,7 @@ List existing locations before proposing a path.
 
 ### 0. Auth precheck
 
-Refuse if the human did not name the Databricks account and workspace targets, target cloud, and that cloud's expected identifier and auth context.
-AWS requires an account id and named profile.
-Azure requires an expected subscription id and active Azure CLI context.
-GCP requires a project id and named configuration.
+Refuse if the human did not name all of these: Databricks account id, Databricks account CLI profile, workspace host, workspace id, workspace CLI profile, target cloud (`aws`, `azure`, or `gcp`), cloud account id, cloud CLI profile.
 Do not invoke the skill until every named target is present.
 
 Run live checks:
@@ -82,15 +76,11 @@ databricks auth profiles
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
 databricks metastores current --profile <workspace-profile> -o json | jq '{workspace_id, metastore_id, name}'
 databricks current-user me --profile <workspace-profile> -o json | jq '{userName, workspace_id}'
-test "$(aws sts get-caller-identity --profile <aws-profile> --query Account --output text)" = "<aws-account-id>" \
-  || { echo "BLOCKED: AWS account id mismatch"; exit 1; }
-test "$(az account show --query id -o tsv)" = "<azure-subscription-id>" \
-  || { echo "BLOCKED: Azure subscription id mismatch"; exit 1; }
-test "$(gcloud config get-value project --configuration <gcp-configuration>)" = "<gcp-project-id>" \
-  || { echo "BLOCKED: GCP project id mismatch"; exit 1; }
+aws sts get-caller-identity --profile <aws-profile>     # AWS: Account must equal named cloud account id
+az account show --profile <azure-profile>                  # Azure: tenant + subscription must match named ids
+gcloud auth list                                           # GCP: active account must match named project
 ```
 
-Run only the identity block for the target cloud.
 Prefer `metastores current.workspace_id` (and/or account `workspaces get`) as the workspace-id check.
 Treat `workspace_id: null` on `current-user me` as non-blocking when the workspace host matches and `metastores current` returns the named workspace id (common for SP oauth-m2m).
 
@@ -107,9 +97,8 @@ Do not run Terraform.
 | `account workspaces list` fails | Confirm Account admin on the SP; regenerate OAuth secret (AWS) |
 | `metastores current` or `current-user me` fails | `databricks auth login --host <workspace-host> --profile <workspace-profile>` |
 | Workspace id mismatch | Fix workspace profile or human-named workspace id |
-| AWS CLI not authenticated or account id mismatch | `aws sso login --profile <aws-profile>` and use the profile matching `<aws-account-id>` |
-| Azure CLI not authenticated or subscription id mismatch | `az login --tenant <tenant>` then `az account set --subscription <azure-subscription-id>` |
-| GCP CLI not authenticated or project id mismatch | `gcloud auth login --configuration <gcp-configuration>` then set `<gcp-project-id>` in that configuration |
+| Cloud CLI not authenticated | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
+| Cloud account id mismatch | Pick the profile whose account id matches the human-named cloud account id |
 
 ### 1. Check what already exists
 
@@ -198,7 +187,7 @@ databricks api post /api/2.0/sql/statements --profile <workspace-profile> --json
 ```
 
 Expected: failure mentioning a read-only external location (for example `User cannot write to a read-only external location <name>`).
-Do not use catalog-scoped `CREATE TABLE` with a `LOCATION` clause as the first write probe.
+Do not use catalog-scoped `CREATE TABLE` with `LOCATION` as the first write probe.
 It can fail on catalog privileges before testing the location.
 Do not leave probe objects behind on a successful write (that would mean the location was not read-only).
 
@@ -206,8 +195,8 @@ Do not leave probe objects behind on a successful write (that would mean the loc
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **blocked: auth preflight failed** before Run | Missing Databricks target or cloud-specific expected id and auth context | Ask for the AWS profile, active Azure context, or gcloud configuration required by the selected cloud; rerun ### 0 |
-| Cloud identity check fails | Wrong AWS profile, active Azure subscription, or gcloud configuration | Reauthenticate the selected context and make its live identifier match the human-provided expected id |
+| **blocked: auth preflight failed** before Run | Missing named account id, profiles, workspace host/id, or cloud account id | Ask the human for every required target; rerun ### 0 |
+| Cloud STS fails or account id mismatch | Expired or wrong cloud profile | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
 | Workspace profile fails `metastores current` | Expired workspace login or wrong host | `databricks auth login --host <workspace-host> --profile <workspace-profile>` |
 | Skill invoked despite red precheck | Agent skipped ### 0 | Always run ### 0 first; stop on any failure |
 | SQL read fails on every operation | IAM role trust / Access Connector role assignment not propagated | Wait a minute and retry. Cloud IAM is eventually consistent. |

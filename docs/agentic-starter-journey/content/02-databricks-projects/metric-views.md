@@ -43,11 +43,11 @@ Invoke these verified skills in order:
 | Measure definitions | Human-provided | Provide names, display names, aggregates, comments, and required columns |
 | Reconciliation policy | Human-provided | Provide dimension grain, decimal tolerances, and exact measures |
 | Join definition | Human-provided | Set `METRIC_JOIN_MODE` to `none` or `joined`; for `joined`, provide the source FQN, alias, `left` type, fact key, and dimension key |
-| Join policies | Human-provided | For `joined`, reject null keys and duplicate dimension keys; default `UNMATCHED_ROW_POLICY` to `reject`, or explicitly accept unmatched rows and their null-dimension consequence |
+| Join quality | Human-provided | For `joined`, require nonnull keys, unique dimension keys, and zero unmatched fact rows |
 | Derived verification | Agent-derived | Resolve catalog, warehouse, FQN, and required columns; check source and key quality; translate the selected definition into raw baseline SQL |
 
 For `join_mode=none`, every join-specific input is not applicable and the DDL must not contain a `joins:` block.
-For `join_mode=joined`, refuse `UNMATCHED_ROW_POLICY=accept` unless the human-provided input explicitly records both acceptance and the null-dimension consequence.
+For `join_mode=joined`, reject every unmatched fact row.
 
 ## Run
 
@@ -98,7 +98,6 @@ case "$join_mode" in
     join_name=
     fact_join_key=
     join_key=
-    unmatched_row_policy=not_applicable
     required_join_columns=()
     ;;
   joined)
@@ -106,20 +105,6 @@ case "$join_mode" in
     join_name='<join_name>'
     fact_join_key='<fact_join_key>'
     join_key='<join_key>'
-    unmatched_row_policy=${UNMATCHED_ROW_POLICY:-reject}
-    case "$unmatched_row_policy" in
-      reject) ;;
-      accept)
-        test "${UNMATCHED_ROW_POLICY+x}" = x || {
-          printf 'accept requires an explicit human-provided input\n' >&2
-          exit 1
-        }
-        ;;
-      *)
-        printf 'UNMATCHED_ROW_POLICY must be reject or accept\n' >&2
-        exit 1
-        ;;
-    esac
     required_fact_columns+=("<fact_join_key>")
     required_join_columns=("<join_key>" "<join_dimension_column>")
     ;;
@@ -170,7 +155,7 @@ Expected: auth matches every human-provided target, strict validation succeeds, 
 
 Check required columns in every selected source.
 For the joined branch, always reject null keys and duplicate dimension keys.
-Reject unmatched rows by default and allow them only under the explicit human-approved policy.
+Reject every unmatched fact row.
 
 ```bash
 assert_columns() {
@@ -229,30 +214,22 @@ SQL
   jq -en --argjson counts "$join_counts" '
     $counts[0] == 0
     and $counts[1] == 0
-    and $counts[2] == 0' >/dev/null
-  unmatched_rows=$(jq -er '.[3] | select(. >= 0)' <<<"$join_counts")
-  case "$unmatched_row_policy" in
-    reject)
-      test "$unmatched_rows" -eq 0
-      printf '%s\n' \
-        'source_columns=passed join_quality=passed unmatched_rows=0 unmatched_policy=reject'
-      ;;
-    accept)
-      printf \
-        'source_columns=passed join_quality=passed unmatched_rows=%s unmatched_policy=accepted\n' \
-        "$unmatched_rows"
-      ;;
-  esac
+    and $counts[2] == 0
+    and $counts[3] == 0' >/dev/null
+  jq -en '
+    ([0, 0, 0, 0] | all(. == 0))
+    and (([0, 0, 0, 1] | all(. == 0)) | not)' >/dev/null
+  printf '%s\n' \
+    'source_columns=passed join_quality=passed unmatched_rows=0'
 else
   printf '%s\n' 'source_columns=passed join_quality=not_applicable'
 fi
 ```
 
-Expected with the default policy: `source_columns=passed join_quality=passed unmatched_rows=0 unmatched_policy=reject`.
-Expected only with explicit human acceptance: `source_columns=passed join_quality=passed unmatched_rows=<observed-nonnegative-count> unmatched_policy=accepted`.
+Expected for the joined branch: `source_columns=passed join_quality=passed unmatched_rows=0`.
 
 Null keys and duplicate dimension keys always fail.
-Unmatched rows fail by default and pass only when the input explicitly sets `UNMATCHED_ROW_POLICY=accept`.
+Every unmatched row fails.
 The no-join branch prints `source_columns=passed join_quality=not_applicable`.
 
 ### 2. Add exactly one YAML 1.1 metric-view DDL
@@ -628,7 +605,7 @@ The result proves positive equal row counts, no nulls, configured comparisons an
 | DDL contains `{{catalog}}` | The catalog parameter is missing | Restore the parameter and target variable |
 | Source-column validation fails | An expression references a missing column | Correct the definition or source |
 | Join quality fails | Keys are null or duplicated | Repair keys before using the join |
-| Unmatched rows fail | A fact has no dimension match | Repair sources or explicitly accept the null-dimension consequence |
+| Unmatched rows fail | A fact has no dimension match | Repair the source relationship before deployment |
 | Job is not successful | Its SQL task failed or was skipped | Repair the captured task error |
 | Semantic or reconciliation validation fails | Results contain nulls, unequal rows, or measure mismatches | Align source, dimensions, measures, grain, comparisons, and tolerance |
 

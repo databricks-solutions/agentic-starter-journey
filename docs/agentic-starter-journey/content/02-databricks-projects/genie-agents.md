@@ -41,8 +41,7 @@ Invoke these verified skills in order:
 |---|---|---|
 | `DATABRICKS_ACCOUNT_ID`, `DATABRICKS_WORKSPACE_ID`, `DATABRICKS_HOST`, `DATABRICKS_CONFIG_PROFILE`, `PROJECT_PATH` | Human-provided | Named target and project |
 | `GENIE_TITLE`, `GENIE_DESCRIPTION` | Human-provided | Exact title and purpose |
-| `GENIE_REQUESTED_PARENT_PATH` | Human-provided | `/Workspace/Users/ivan.calvo@databricks.com/genie_agents` |
-| `GENIE_PERSISTED_PARENT_PATH` | Human-provided | `/Users/ivan.calvo@databricks.com/genie_agents` |
+| `GENIE_APPROVED_REQUEST_SHA256` | Human-provided | Record the SHA-256 printed for the fully rendered and approved `src/genie_agent.json` |
 | Source FQNs and column configurations | Human-provided | Permitted sources and metadata |
 | Sample questions | Human-provided | Exact approved samples |
 | Example questions | Human-provided | Exact approved examples |
@@ -50,43 +49,37 @@ Invoke these verified skills in order:
 | Example SQL | Human-provided | Validated read-only SQL |
 | `GENIE_VALIDATION_QUESTION`, `GENIE_SPACE_ID`, `GENIE_STATE_FILE` | Human-provided | One query; ID optional on first create and authoritative when set; optional target-owned state |
 | Warehouse, source metadata, stable IDs, `GENIE_BASELINE_SQL`, expected result | Agent-derived | Resolve and validate the complete design |
-| Observed persistence contract | Agent-derived | `request_source_key=metric_views`, `persisted_source_key=tables`, persisted parent `/Users/ivan.calvo@databricks.com/genie_agents`, `create_id_field=space_id`, and `query_attachment_id_field=attachment_id` |
+| Requested and persisted parent paths | Agent-derived | Derive `/Workspace/Users/<current-user.userName>/genie_agents` for requests and `/Users/<current-user.userName>/genie_agents` for persisted metadata |
+| Observed persistence contract | Agent-derived | `request_source_key=metric_views`, `persisted_source_key=tables`, `create_id_field=space_id`, and `query_attachment_id_field=attachment_id` |
 
 ## Run
 
 ### 0. Design and obtain explicit approval
 
-Present the title, description, requested parent path, expected persisted parent path, request source key `metric_views`, expected exported source key `tables`, warehouse, every source, every column configuration, every instruction, every sample question, every example SQL, and the entire parsed request JSON.
-Obtain explicit human approval of that complete design.
-General approval is insufficient.
-Do not create the parent folder, create a space, or update a space before this approval.
-
-Create `src/genie_agent.json` after approval:
+Create `src/genie_agent.json` as the complete proposed request:
 
 ```json
 {
   "version": 2,
-  "config": {
-    "sample_questions": [{"id": "10000000000000000000000000000001", "question": ["<sample_question>"]}]
-  },
-  "data_sources": {
-    "metric_views": [{
-      "identifier": "<catalog>.<schema>.<metric_view>",
-      "column_configs": [{
-        "column_name": "<categorical_dimension>",
-        "enable_entity_matching": true,
-        "enable_format_assistance": true,
-        "synonyms": ["<approved_synonym>"]
-      }]
-    }]
-  },
-  "instructions": {
-    "example_question_sqls": [{"id": "20000000000000000000000000000001", "question": ["<representative_question>"], "sql": ["<validated_read_only_sql>"]}],
-    "text_instructions": [{"id": "30000000000000000000000000000001", "content": ["<approved_global_instruction>"]}]
-  }
+  "config": {"sample_questions": [{"id": "10000000000000000000000000000001", "question": ["<sample_question>"]}]},
+  "data_sources": {"metric_views": [{"identifier": "<catalog>.<schema>.<metric_view>", "column_configs": [{"column_name": "<categorical_dimension>", "enable_entity_matching": true, "enable_format_assistance": true, "synonyms": ["<approved_synonym>"]}]}]},
+  "instructions": {"example_question_sqls": [{"id": "20000000000000000000000000000001", "question": ["<representative_question>"], "sql": ["<validated_read_only_sql>"]}], "text_instructions": [{"id": "30000000000000000000000000000001", "content": ["<approved_global_instruction>"]}]}
 }
 ```
 
+Render the full file bytes, its entire parsed JSON, and its checksum for approval:
+
+```bash
+cat src/genie_agent.json
+jq '.' src/genie_agent.json
+shasum -a 256 src/genie_agent.json
+```
+
+Present the title, description, principal-derived requested parent path, expected persisted parent path, request source key `metric_views`, expected exported source key `tables`, warehouse, every source, every column configuration, every instruction, every sample question, every example SQL, and both complete renderings.
+Obtain explicit human approval of that complete design and record the printed hash as `GENIE_APPROVED_REQUEST_SHA256`.
+General approval is insufficient.
+Do not modify the approved file after recording its hash.
+Do not create the parent folder, create a space, or update a space before this approval.
 Do not author request serialization with `tables`.
 
 ### 1. Verify auth and resolve the strict target
@@ -102,8 +95,7 @@ set -euo pipefail
 : "${PROJECT_PATH:?}"
 : "${GENIE_TITLE:?}"
 : "${GENIE_DESCRIPTION:?}"
-: "${GENIE_REQUESTED_PARENT_PATH:?}"
-: "${GENIE_PERSISTED_PARENT_PATH:?}"
+: "${GENIE_APPROVED_REQUEST_SHA256:?}"
 : "${GENIE_VALIDATION_QUESTION:?}"
 : "${GENIE_BASELINE_SQL:?}"
 
@@ -113,8 +105,6 @@ databricks() {
 }
 genie_title=$GENIE_TITLE
 genie_description=$GENIE_DESCRIPTION
-requested_parent_path=$GENIE_REQUESTED_PARENT_PATH
-persisted_parent_path=$GENIE_PERSISTED_PARENT_PATH
 direct_space_id=${GENIE_SPACE_ID:-}
 genie_state_file=${GENIE_STATE_FILE:-}
 validation_question=$GENIE_VALIDATION_QUESTION
@@ -122,7 +112,6 @@ baseline_sql=$GENIE_BASELINE_SQL
 answer_file=$(mktemp)
 baseline_file=$(mktemp)
 sources_file=$(mktemp)
-sql_gate=$(mktemp)
 if test -n "$direct_space_id"
 then
   jq -en --arg id "$direct_space_id" \
@@ -139,6 +128,12 @@ jq -e \
       .account_id // .details.configuration.account_id.value,
       (.workspace_id // .details.configuration.workspace_id.value | tostring)
     ] == [$host, $account, $workspace]' >/dev/null <<<"$auth"
+principal=$(databricks current-user me -o json \
+  | jq -er '.userName | select(type == "string" and length > 0 and (contains("/") | not))')
+requested_parent_path="/Workspace/Users/$principal/genie_agents"
+persisted_parent_path="/Users/$principal/genie_agents"
+printf '%s  %s\n' "$GENIE_APPROVED_REQUEST_SHA256" src/genie_agent.json \
+  | shasum -a 256 -c -
 bundle=$(databricks bundle validate --strict --target dev \
   -o json)
 warehouse_id=$(jq -er '
@@ -151,6 +146,10 @@ do
 done < <(jq -er '.data_sources.metric_views[].identifier' src/genie_agent.json)
 test "${#configured_sources[@]}" -ge 1
 printf '%s\n' "${configured_sources[@]}" >"$sources_file"
+expected_persisted_space=$(jq -ce '
+  .data_sources.tables = .data_sources.metric_views
+  | del(.data_sources.metric_views)
+' src/genie_agent.json)
 databricks workspace mkdirs "$requested_parent_path"
 ```
 
@@ -163,17 +162,18 @@ assert_space() {
     --arg title "$genie_title" \
     --arg description "$genie_description" \
     --arg persisted_parent "$persisted_parent_path" \
-    --argjson configured "$(printf '%s\n' "${configured_sources[@]}" | jq -R . | jq -s 'sort')" '
+    --argjson expected "$expected_persisted_space" '
       .warehouse_id == $warehouse_id
       and .title == $title
       and .description == $description
       and .parent_path == $persisted_parent
-      and (.serialized_space | fromjson
-        | .version == 2
-        and (.data_sources | keys) == ["tables"]
-        and ([.data_sources.tables[].identifier] | sort) == $configured)' \
+      and (.serialized_space | fromjson) == $expected' \
     >/dev/null <<<"$1"
 }
+jq -en --argjson expected "$expected_persisted_space" '
+  $expected == $expected
+  and (($expected | .instructions = {}) != $expected)
+' >/dev/null
 state_space_id=
 if test -n "$genie_state_file" && test -f "$genie_state_file"
 then
@@ -325,6 +325,9 @@ Do not define a native Genie bundle resource.
 
 ### Verify canonical persistence
 
+Canonicalize only the request key `data_sources.metric_views` to the persisted key `data_sources.tables`.
+Require the entire remaining parsed serialized configuration to equal the approved request, while preserving exact warehouse, title, description, and principal-derived parent checks.
+
 ```bash
 space=$(databricks genie get-space "$space_id" \
   --include-serialized-space -o json)
@@ -365,40 +368,35 @@ generated_sql=$(jq -er '.query.query' <<<"$query_attachment")
 
 ### Gate generated and baseline SQL
 
-```bash
-cat >"$sql_gate" <<'PY'
-import sys
+Create `src/verify_genie_sql.py`:
 
+```text
+import sys
 sql, sources_file, mode = sys.argv[1].strip(), sys.argv[2], sys.argv[3]
 WORD, NAME, SYMBOL = range(3)
 
 def tokenize(text):
-    result, state = [], "code"
+    result = []
     index = depth = 0
     while index < len(text):
-        char = text[index]
-        pair = text[index : index + 2]
+        char, pair = text[index], text[index:index + 2]
         if pair == "--":
-            state, index = "line", text.find("\n", index + 2)
+            index = text.find("\n", index + 2)
             index = len(text) if index < 0 else index + 1
-            state = "code"
         elif pair == "/*":
-            state, index = "block", text.find("*/", index + 2)
+            index = text.find("*/", index + 2)
             assert index >= 0, "unclosed block comment"
-            state, index = "code", index + 2
+            index += 2
         elif char in {"'", '"', "`"}:
-            state, quote, value, index = "quote", char, "", index + 1
+            quote, value, index = char, "", index + 1
             while index < len(text):
-                pair = text[index : index + 2]
                 if text[index] == "\\": index += 2
-                elif pair == quote * 2:
-                    value, index = value + quote, index + 2
+                elif text[index:index + 2] == quote * 2: value, index = value + quote, index + 2
                 elif text[index] == quote:
-                    state, index = "code", index + 1
+                    index += 1
                     break
-                else:
-                    value, index = value + text[index], index + 1
-            assert state == "code", "unclosed quote"
+                else: value, index = value + text[index], index + 1
+            else: raise AssertionError("unclosed quote")
             if quote == "`": result.append((NAME, value, depth))
         elif char.isspace(): index += 1
         elif char == "(":
@@ -433,14 +431,9 @@ set_operators = {"UNION", "EXCEPT", "INTERSECT", "MINUS"}
 assert not any(token[2] == 0 and token[0] == WORD and token[1].upper() in set_operators for token in tokens), "set operations are forbidden"
 mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY"}
 assert not any(token[0] == WORD and token[1].upper() in mutations for token in tokens), "mutation or side-effecting SQL is forbidden"
-
 query_starters = {"SELECT", "WITH", "TABLE", "VALUES", "FROM"}
 assert not any(token[2] > 0 and token[0] == WORD and token[1].upper() in query_starters for token in tokens), "nested query is forbidden"
-
-terminators = {
-    "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY",
-    "UNION", "EXCEPT", "INTERSECT", "MINUS", "WINDOW", "DISTRIBUTE", "SORT", "CLUSTER",
-}
+terminators = {"WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY", "UNION", "EXCEPT", "INTERSECT", "MINUS", "WINDOW", "DISTRIBUTE", "SORT", "CLUSTER"}
 relation_indexes = [index for index, token in enumerate(tokens) if is_keyword(token, "FROM") or is_keyword(token, "JOIN")]
 assert relation_indexes, "at least one FROM or JOIN target is required"
 for start in [index for index in relation_indexes if is_keyword(tokens[index], "FROM")]:
@@ -448,7 +441,6 @@ for start in [index for index in relation_indexes if is_keyword(tokens[index], "
     for token in tokens[start + 1 :]:
         if token[2] < scope or (token[2] == scope and token[0] == WORD and token[1].upper() in terminators): break
         assert token[2] != scope or token[1] != ",", "comma-separated relations are forbidden"
-
 allowed = {line.strip().replace("`", "") for line in open(sources_file) if line.strip()}
 assert allowed
 configured = set()
@@ -467,14 +459,28 @@ assert configured, "query must read at least one configured FQN"
 outputs = {"generated": "read_only_query=true\ngrounded_sources=true", "baseline": "baseline_read_only=true"}
 assert mode in outputs, mode
 print(outputs[mode])
-PY
-python3 "$sql_gate" "$generated_sql" "$sources_file" generated
-python3 "$sql_gate" "$baseline_sql" "$sources_file" baseline
+```
+
+Run the same gate against both queries:
+
+```bash
+python3 src/verify_genie_sql.py "$generated_sql" "$sources_file" generated
+python3 src/verify_genie_sql.py "$baseline_sql" "$sources_file" baseline
 ```
 
 The lexer tracks quote, comment, and parenthesis state, rejects top-level relation commas, and authorizes every `FROM` and `JOIN` FQN.
 
 ### Fetch and compare the exact result
+
+Create `src/verify_complete_statement.jq`:
+
+```text
+.status.state == "SUCCEEDED" and (.result.data_array | type == "array")
+and (.manifest.truncated // false) == false and (.manifest.total_chunk_count // 1) == 1
+and ((.manifest.chunks // [null]) | length) == 1 and (.result.chunk_index // 0) == 0
+and (.result.next_chunk_internal_link // "") == "" and (.result.next_chunk_external_link // "") == ""
+and (.manifest.total_row_count | type == "number") and .manifest.total_row_count == (.result.data_array | length)
+```
 
 ```bash
 databricks genie get-message-attachment-query-result \
@@ -482,37 +488,43 @@ databricks genie get-message-attachment-query-result \
   -o json >"$answer_file"
 
 run_sql() {
-  local statement=$1 response statement_id state
-  response=$(
-    databricks api post /api/2.0/sql/statements \
-      --json "$(jq -n \
-        --arg warehouse_id "$warehouse_id" \
-        --arg statement "$statement" \
-        '{warehouse_id:$warehouse_id,statement:$statement,wait_timeout:"0s"}')"
-  ) || return
-  statement_id=$(jq -er '.statement_id' <<<"$response") || return
-  while :
-  do
-    state=$(jq -er '.status.state' <<<"$response") || return
-    case "$state" in
-      SUCCEEDED) printf '%s\n' "$response"; return 0 ;;
-      PENDING|RUNNING)
-        sleep 5
-        response=$(databricks api get "/api/2.0/sql/statements/$statement_id") || return
-        ;;
-      *) jq -c '.status.error // .status' >&2 <<<"$response"; return 1 ;;
-    esac
-  done
+  databricks api post /api/2.0/sql/statements \
+    --json "$(jq -n \
+      --arg warehouse_id "$warehouse_id" \
+      --arg statement "$1" \
+      '{warehouse_id:$warehouse_id,statement:$statement,wait_timeout:"50s",on_wait_timeout:"CANCEL"}')" \
+    | jq -e 'select(.status.state == "SUCCEEDED")'
 }
 run_sql "$baseline_sql" >"$baseline_file"
-jq -e '.status.state == "SUCCEEDED" and .result.data_array != null' \
-  "$baseline_file" >/dev/null
+jq -e -f src/verify_complete_statement.jq "$baseline_file" >/dev/null
+answer_statement_file=$(mktemp)
+jq -e '.statement_response' "$answer_file" >"$answer_statement_file"
+jq -e -f src/verify_complete_statement.jq "$answer_statement_file" >/dev/null
+
+complete_fixture=$(mktemp)
+jq -n '{status:{state:"SUCCEEDED"},manifest:{truncated:false,total_chunk_count:1,total_row_count:1},result:{chunk_index:0,data_array:[["1"]]}}' >"$complete_fixture"
+jq -e -f src/verify_complete_statement.jq "$complete_fixture" >/dev/null
+for incomplete_fixture in \
+  '.manifest.truncated = true' \
+  '.manifest.total_chunk_count = 2' \
+  '.manifest.chunks = [{}, {}]' \
+  '.result.next_chunk_internal_link = "/next"' \
+  '.manifest.total_row_count = 2' \
+  '.status.state = "RUNNING"'
+do
+  if jq "$incomplete_fixture" "$complete_fixture" \
+    | jq -e -f src/verify_complete_statement.jq >/dev/null
+  then
+    printf 'incomplete result fixture passed: %s\n' "$incomplete_fixture" >&2
+    exit 1
+  fi
+done
 
 canonical_filter='def normalize: if type == "string" and test("^-?[0-9]+([.][0-9]+)?$") then tonumber else . end;'
-jq -S "$canonical_filter"'{columns:[.manifest.schema.columns[].name],rows:([.result.data_array[]|map(normalize)]|sort)}' \
+jq -S "$canonical_filter"'{columns:[.manifest.schema.columns[].name],rows:([.result.data_array[]|map(normalize)]|sort),row_count:.manifest.total_row_count}' \
   "$baseline_file" >"$baseline_file.canonical"
-jq -S "$canonical_filter"'{columns:[.statement_response.manifest.schema.columns[].name],rows:([.statement_response.result.data_array[]|map(normalize)]|sort)}' \
-  "$answer_file" >"$answer_file.canonical"
+jq -S "$canonical_filter"'{columns:[.manifest.schema.columns[].name],rows:([.result.data_array[]|map(normalize)]|sort),row_count:.manifest.total_row_count}' \
+  "$answer_statement_file" >"$answer_file.canonical"
 diff -u "$baseline_file.canonical" "$answer_file.canonical"
 printf '%s\n' 'query_result_matches_baseline=true'
 ```
@@ -528,6 +540,7 @@ query_result_matches_baseline=true
 ```
 
 Response prose is not verified.
+Truncated, declared multi-chunk, extra chunk-manifest, next-link, row-count, and noncompleted fixtures must all fail before exact comparison.
 
 ## Where this fails
 

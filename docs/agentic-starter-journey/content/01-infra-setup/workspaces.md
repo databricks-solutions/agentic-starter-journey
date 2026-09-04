@@ -220,4 +220,3 @@ On Azure, workspace admin for the creator is often automatic via Azure AD. `data
 
 - **Do next:** [Catalogs](/docs/01-infra-setup/catalogs/)
 - **Manual fallback:** [Starter Journey: create workspaces](https://databricks-solutions.github.io/starter-journey/docs/03-infra-setup/create-workspaces/)
-- **Reference:** [Databricks Terraform provider](https://registry.terraform.io/providers/databricks/databricks/latest/docs), [AWS feature regions](https://docs.databricks.com/aws/en/resources/feature-region-support), [Azure feature regions](https://learn.microsoft.com/en-us/azure/databricks/resources/feature-region-support)

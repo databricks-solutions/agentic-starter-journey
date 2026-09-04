@@ -25,4 +25,3 @@ The order is load-bearing. Prerequisites must pass before workspaces can be crea
 ## Next
 
 - **Do next:** [Pre-requisites](/docs/01-infra-setup/prerequisites/)
-- **Reference:** [Databricks administration](https://docs.databricks.com/aws/en/admin/)

@@ -537,5 +537,5 @@ Response prose is not verified.
 
 ## Next
 
-- **Do next:** [Databricks Jobs](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-jobs)
+- **Do next:** [Databricks Jobs](/docs/02-databricks-projects/databricks-jobs/)
 - **Back to section:** [Databricks Projects](/docs/02-databricks-projects/)

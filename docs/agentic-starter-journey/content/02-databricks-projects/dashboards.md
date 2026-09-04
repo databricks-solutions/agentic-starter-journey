@@ -660,4 +660,5 @@ Expected: identity, duplicate, publish, and serialization checks report true, an
 
 ## Next
 
+- **Do next:** [Genie Agents](/docs/02-databricks-projects/genie-agents/)
 - **Back to section:** [Databricks Projects](/docs/02-databricks-projects/)

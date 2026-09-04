@@ -176,4 +176,3 @@ For Zerobus, also confirm the client received acknowledgments:
 ## Next
 
 - **Do next:** [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/)
-- **Reference:** [Lakeflow Connect](https://docs.databricks.com/aws/en/data-ingestion/ingest/), [Zerobus Ingest](https://docs.databricks.com/ingestion/zerobus-ingest)

@@ -13,10 +13,7 @@ One repo, one bundle, one owning team.
 
 ## Run in this order
 
-The project repo and bundle must exist before any pipeline lands in it.
-The third page reads the shared Bakehouse batch source and publishes governed bronze and silver materialized views.
-The fourth page adds governed measures over those silver views and verifies them against raw SQL.
-The fifth page deploys and publishes the Bakehouse franchise-performance dashboard from the governed metric view.
+Create the project repo, add ingestion when the source requires it, build the Spark Declarative Pipeline, define the metric view, publish the dashboard, ground the Genie Agent, then orchestrate the pipeline with jobs.
 
 | Order | Page | Skill | Status |
 |---|---|---|---|
@@ -25,10 +22,9 @@ The fifth page deploys and publishes the Bakehouse franchise-performance dashboa
 | 3 | [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/) | `databricks-pipelines` | Done |
 | 4 | [Metric Views](/docs/02-databricks-projects/metric-views/) | `databricks-metric-views` | Done |
 | 5 | [Dashboards](/docs/02-databricks-projects/dashboards/) | `databricks-core`, `databricks-aibi-dashboards`, `databricks-dabs` | Done |
-
-Pages are linked as they are added.
+| 6 | [Genie Agents](/docs/02-databricks-projects/genie-agents/) | `databricks-core`, `databricks-genie-agents`, `databricks-dabs` | Done |
+| 7 | [Databricks Jobs](/docs/02-databricks-projects/databricks-jobs/) | `databricks-core`, `databricks-jobs`, `databricks-dabs` | Done |
 
 ## Next
 
 - **Do next:** [Project repo](/docs/02-databricks-projects/project-repo/)
-- **Reference:** [Databricks Asset Bundles](https://docs.databricks.com/aws/en/dev-tools/bundles/)

@@ -210,4 +210,3 @@ Do not leave probe objects behind on a successful write (that would mean the loc
 
 - **Do next:** [Databricks Projects](/docs/02-databricks-projects/)
 - **Manual fallback:** [Starter Journey: cloud object storage](https://databricks-solutions.github.io/starter-journey/docs/06-access-your-data/cloud-object-storage/)
-- **Reference:** [External locations](https://docs.databricks.com/aws/en/connect/unity-catalog/external-locations)

@@ -248,4 +248,3 @@ A failure here with the metadata all correct usually means the storage credentia
 
 - **Do next:** [Cloud Object Storage access](/docs/01-infra-setup/cloud-object-storage/)
 - **Manual fallback:** [Starter Journey: data governance](https://databricks-solutions.github.io/starter-journey/docs/05-data-governance-strategy/)
-- **Reference:** [Create catalogs](https://docs.databricks.com/aws/en/catalogs/create-catalog)

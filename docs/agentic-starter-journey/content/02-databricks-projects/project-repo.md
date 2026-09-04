@@ -211,4 +211,3 @@ A `FAIL` on staging or production here is usually the service principal not exis
 ## Next
 
 - **Do next:** [Ingestion Pipelines](/docs/02-databricks-projects/ingestion-pipelines/)
-- **Reference:** [Bundle configuration](https://docs.databricks.com/aws/en/dev-tools/bundles/settings)

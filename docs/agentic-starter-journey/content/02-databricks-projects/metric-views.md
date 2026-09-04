@@ -267,17 +267,8 @@ else
 fi
 ```
 
-Expected with the default policy:
-
-```text
-source_columns=passed join_quality=passed unmatched_rows=0 unmatched_policy=reject
-```
-
-Expected only with explicit human acceptance:
-
-```text
-source_columns=passed join_quality=passed unmatched_rows=<observed-nonnegative-count> unmatched_policy=accepted
-```
+Expected with the default policy: `source_columns=passed join_quality=passed unmatched_rows=0 unmatched_policy=reject`.
+Expected only with explicit human acceptance: `source_columns=passed join_quality=passed unmatched_rows=<observed-nonnegative-count> unmatched_policy=accepted`.
 
 Null keys and duplicate dimension keys always fail.
 Unmatched rows fail by default and pass only when the input explicitly sets `UNMATCHED_ROW_POLICY=accept`.
@@ -478,11 +469,7 @@ run_sql "$semantic_statement" \
 printf '%s\n' 'metadata=passed semantic_query=passed'
 ```
 
-Expected:
-
-```text
-metadata=passed semantic_query=passed
-```
+Expected: `metadata=passed semantic_query=passed`.
 
 ### Reconcile semantic and raw results
 
@@ -526,7 +513,6 @@ SQL
 )
 fi
 
-null_safe_operator=$'\x3c\x3d\x3e'
 reconciliation_statement=$(cat <<SQL
 WITH metric AS (
   SELECT
@@ -562,15 +548,15 @@ mismatches AS (
   SELECT 1
   FROM metric m
   FULL OUTER JOIN raw r
-    ON m.<dimension_one> $null_safe_operator r.<dimension_one>
-   AND m.<dimension_two> $null_safe_operator r.<dimension_two>
-   AND m.<dimension_three> $null_safe_operator r.<dimension_three>
+    ON m.<dimension_one> <=> r.<dimension_one>
+   AND m.<dimension_two> <=> r.<dimension_two>
+   AND m.<dimension_three> <=> r.<dimension_three>
   WHERE m.row_present IS NULL
      OR r.row_present IS NULL
      OR m.<measure_one> IS NULL
      OR r.<measure_one> IS NULL
      OR abs(m.<measure_one> - r.<measure_one>) > <decimal_tolerance>
-     OR NOT (m.<measure_two> $null_safe_operator r.<measure_two>)
+     OR NOT (m.<measure_two> <=> r.<measure_two>)
      OR m.<measure_three> IS NULL
      OR r.<measure_three> IS NULL
      OR abs(m.<measure_three> - r.<measure_three>) > <decimal_tolerance>
@@ -601,14 +587,9 @@ printf '%s\n' \
   'metric_rows>0 metric_rows=raw_rows metric_null_rows=0 raw_null_rows=0 mismatch_rows=0'
 ```
 
-Expected:
-
-```text
-metric_rows>0 metric_rows=raw_rows metric_null_rows=0 raw_null_rows=0 mismatch_rows=0
-```
+Expected: `metric_rows>0 metric_rows=raw_rows metric_null_rows=0 raw_null_rows=0 mismatch_rows=0`.
 
 Both raw SQL branches are independently executable.
-The generated dimension predicates use `<=> r.<dimension_one>`, `<=> r.<dimension_two>`, and `<=> r.<dimension_three>`, and the configured exact measure uses the same null-safe operator.
 One result row proves positive semantic rows, equal row counts, zero null dimensions or measures on both sides, configured null-safe exact comparisons and decimal tolerances, and zero mismatches.
 
 ## Where this fails

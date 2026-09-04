@@ -12,7 +12,7 @@ Author metric-view requests under `data_sources.metric_views`, then verify the p
 Treat the create parent as requested input and the `get-space` parent as its canonical persisted form.
 Persist the created space ID as ownership state and use that ID for every update.
 Validate one deterministic question through the Conversation API against an independent baseline.
-Generated `WITH` or nested queries fail closed, so use a simpler question or explicit `JOIN` shape.
+Generated `WITH`, nested, or set-operation queries fail closed, so use a simpler question or explicit `JOIN` shape.
 
 ## Goal
 
@@ -422,7 +422,10 @@ assert not semicolons or semicolons == [len(tokens) - 1], "multiple or embedded 
 if semicolons: tokens.pop()
 is_keyword = lambda token, word: token[0] == WORD and token[1].upper() == word
 assert is_keyword(tokens[0], "SELECT"), "first token must be SELECT"
+assert sum(token[2] == 0 and is_keyword(token, "SELECT") for token in tokens) == 1, "exactly one top-level SELECT is required"
 assert not any(is_keyword(token, "WITH") for token in tokens), "WITH is forbidden"
+set_operators = {"UNION", "EXCEPT", "INTERSECT"}
+assert not any(token[2] == 0 and token[0] == WORD and token[1].upper() in set_operators for token in tokens), "set operations are forbidden"
 mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY"}
 assert not any(token[0] == WORD and token[1].upper() in mutations for token in tokens), "mutation or side-effecting SQL is forbidden"
 
@@ -529,7 +532,7 @@ Response prose is not verified.
 | Source keys, FQNs, ID, or state drift | The target-owned contract differs | Reconcile ownership |
 | Warehouse, permission, Conversation, or attachment check fails | The target or question is wrong | Correct it |
 | Generated `WITH` query fails | The safety gate accepts only top-level `SELECT` | Ask a simpler deterministic question or require explicit configured joins |
-| SQL safety fails | The query mutates, nests, uses multiple statements, comma relations, or unconfigured sources | Reject it |
+| SQL safety fails | The query mutates, nests, uses set operations, multiple statements, comma relations, or unconfigured sources | Reject it |
 | Result differs | SQL or data drifted | Reconcile both |
 
 ## Next

@@ -343,12 +343,12 @@ do
   message=$(databricks genie get-message \
     "$space_id" "$conversation_id" "$message_id" \
     -o json)
-  status=$(jq -er '.status' <<<"$message")
-  case "$status" in
+  message_status=$(jq -er '.status' <<<"$message")
+  case "$message_status" in
     COMPLETED) break ;;
     SUBMITTED|FILTERING_CONTEXT|ASKING_AI|EXECUTING_QUERY) sleep 5 ;;
     FAILED|CANCELLED) jq '.' >&2 <<<"$message"; exit 1 ;;
-    *) printf 'unknown Genie status: %s\n' "$status" >&2; exit 1 ;;
+    *) printf 'unknown Genie status: %s\n' "$message_status" >&2; exit 1 ;;
   esac
 done
 printf '%s\n' 'conversation=COMPLETED'

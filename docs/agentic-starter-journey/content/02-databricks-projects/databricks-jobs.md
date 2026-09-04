@@ -256,18 +256,29 @@ Expected: the exact one-task graph and exact two-task dependency graph pass befo
 
 ## Verify
 
-Define fail-closed helpers for baseline capture, bounded pagination, exact job polling, update correlation, and output verification.
+Define fail-closed helpers for idle baseline capture, bounded pagination, exact job polling, update correlation, and output verification.
 
 ```bash
-capture_baseline() {
-  local response
-  response=$(databricks pipelines list-updates "$pipeline_id" \
-    --max-results 1 --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
-  jq -er '
-    .updates
-    | select(length == 1)
-    | .[0].update_id
-    | select(type == "string" and length > 0)' <<<"$response"
+capture_idle_baseline() {
+  local response update_id update state
+  while :
+  do
+    response=$(databricks pipelines list-updates "$pipeline_id" \
+      --max-results 1 --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+    update_id=$(jq -er '
+      .updates
+      | select(length == 1)
+      | .[0].update_id
+      | select(type == "string" and length > 0)' <<<"$response") || return
+    update=$(databricks pipelines get-update "$pipeline_id" "$update_id" \
+      --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
+    state=$(jq -er '.update.state' <<<"$update") || return
+    case "$state" in
+      COMPLETED|FAILED|CANCELED) printf '%s\n' "$update_id"; return 0 ;;
+      CREATED|INITIALIZING|QUEUED|RESETTING|RUNNING|SETTING_UP_TABLES|WAITING_FOR_RESOURCES|STOPPING) sleep 15 ;;
+      *) printf 'unknown update state: %s\n' "$state" >&2; return 1 ;;
+    esac
+  done
 }
 
 collect_updates_through_baseline() {
@@ -391,7 +402,7 @@ assert_output_nonempty() {
 }
 ```
 
-The baseline capture requires one prior update.
+The idle baseline capture requires one prior update and waits until the newest update is terminal before triggering a job.
 The collection reads newest-first pages without `--until-update-id`, whose CLI semantics return the baseline and older updates.
 The paginated collection fails if it cannot reach that baseline within 20 pages of 100 updates.
 This assumes fewer than 2000 updates occur between immediate baseline capture and run completion.
@@ -399,7 +410,7 @@ This assumes fewer than 2000 updates occur between immediate baseline capture an
 Run and fully verify the single-task job before capturing the DAG baseline.
 
 ```bash
-single_baseline=$(capture_baseline)
+single_baseline=$(capture_idle_baseline)
 single_run_id=$(databricks jobs run-now "$single_job_id" \
   --profile "$DATABRICKS_CONFIG_PROFILE" --no-wait -o json \
   | jq -er '.run_id | tostring')
@@ -430,7 +441,7 @@ Expected: the exact job and its only task are `TERMINATED` with result `SUCCESS`
 Only after that sequence passes, run and verify the DAG.
 
 ```bash
-dag_baseline=$(capture_baseline)
+dag_baseline=$(capture_idle_baseline)
 dag_run_id=$(databricks jobs run-now "$dag_job_id" \
   --profile "$DATABRICKS_CONFIG_PROFILE" --no-wait -o json \
   | jq -er '.run_id | tostring')
@@ -490,7 +501,7 @@ The SQL assertion in the DAG and the independent row-count assertion after each 
 | The poll rejects a terminated run | The job or one of its tasks has a result other than `SUCCESS` | Inspect the exact run output and repair the failing task |
 | The validation task never runs | The refresh task failed or the downstream dependency and `ALL_SUCCESS` condition drifted | Repair the refresh or restore the exact DAG |
 | The timestamp assertion fails | The downstream task began before the refresh task ended or timestamps are absent | Inspect the exact run and restore the dependency |
-| Baseline capture fails | The pipeline has no prior update to delimit the next job-triggered update | Run and complete one pipeline update, then capture a new baseline |
+| Idle baseline capture does not return | The pipeline has no prior update or its newest update remains active | Complete one pipeline update or wait for the active update to become terminal before triggering the job |
 | Pagination exceeds its bound | More than 2000 updates occurred before collection reached the baseline | Repeat from a fresh baseline when update volume is lower |
 | Pagination ends before the baseline | The API history does not contain the captured update | Stop and investigate pipeline history before accepting correlation |
 | Correlation finds no update | No completed `JOB_TASK` update was created inside the exact pipeline task window | Inspect the pipeline task and update timestamps |

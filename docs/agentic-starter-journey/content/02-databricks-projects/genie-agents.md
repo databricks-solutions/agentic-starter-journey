@@ -66,10 +66,7 @@ Create `src/genie_agent.json` after approval:
 {
   "version": 2,
   "config": {
-    "sample_questions": [{
-      "id": "10000000000000000000000000000001",
-      "question": ["<sample_question>"]
-    }]
+    "sample_questions": [{"id": "10000000000000000000000000000001", "question": ["<sample_question>"]}]
   },
   "data_sources": {
     "metric_views": [{
@@ -83,15 +80,8 @@ Create `src/genie_agent.json` after approval:
     }]
   },
   "instructions": {
-    "example_question_sqls": [{
-      "id": "20000000000000000000000000000001",
-      "question": ["<representative_question>"],
-      "sql": ["<validated_read_only_sql>"]
-    }],
-    "text_instructions": [{
-      "id": "30000000000000000000000000000001",
-      "content": ["<approved_global_instruction>"]
-    }]
+    "example_question_sqls": [{"id": "20000000000000000000000000000001", "question": ["<representative_question>"], "sql": ["<validated_read_only_sql>"]}],
+    "text_instructions": [{"id": "30000000000000000000000000000001", "content": ["<approved_global_instruction>"]}]
   }
 }
 ```
@@ -166,6 +156,21 @@ databricks workspace mkdirs "$requested_parent_path"
 ### 2. Resolve ownership and fail closed
 
 ```bash
+assert_space() {
+  jq -e \
+    --arg warehouse_id "$warehouse_id" \
+    --arg title "$genie_title" \
+    --arg persisted_parent "$persisted_parent_path" \
+    --argjson configured "$(printf '%s\n' "${configured_sources[@]}" | jq -R . | jq -s 'sort')" '
+      .warehouse_id == $warehouse_id
+      and .title == $title
+      and .parent_path == $persisted_parent
+      and (.serialized_space | fromjson
+        | .version == 2
+        and (.data_sources | keys) == ["tables"]
+        and ([.data_sources.tables[].identifier] | sort) == $configured)' \
+    >/dev/null <<<"$1"
+}
 state_space_id=
 if test -n "$genie_state_file" && test -f "$genie_state_file"
 then
@@ -196,22 +201,7 @@ if test -n "${space_id:-}"
 then
   existing=$(databricks genie get-space "$space_id" \
     --include-serialized-space -o json)
-  jq -e \
-    --arg warehouse_id "$warehouse_id" \
-    --arg title "$genie_title" \
-    --arg persisted_parent "$persisted_parent_path" \
-    --argjson configured \
-      "$(printf '%s\n' "${configured_sources[@]}" | jq -R . | jq -s 'sort')" '
-      .title == $title
-      and .warehouse_id == $warehouse_id
-      and .parent_path == $persisted_parent
-      and (
-        .serialized_space
-        | fromjson
-        | (.data_sources | keys) == ["tables"]
-          and ([.data_sources.tables[].identifier] | sort) == $configured
-      )' \
-    >/dev/null <<<"$existing"
+  assert_space "$existing"
   deploy_action=update
 else
   collisions=0
@@ -281,33 +271,27 @@ then
     "$genie_state_file" \
     "$requested_parent_path" \
     "$persisted_parent_path" <<'PY'
-import json
-import os
-import sys
-
-response = json.load(open(sys.argv[1]))
+import json, os, sys
+response_path, state_path, requested, persisted = sys.argv[1:]
+response = json.load(open(response_path))
 space_id = response["space_id"]
 assert isinstance(space_id, str) and space_id
-temporary = sys.argv[2] + ".tmp"
+state = {
+    "space_id": space_id,
+    "request_source_key": "metric_views",
+    "persisted_source_key": "tables",
+    "requested_parent_path": requested,
+    "persisted_parent_path": persisted,
+    "create_id_field": "space_id",
+    "query_attachment_id_field": "attachment_id",
+}
+temporary = state_path + ".tmp"
 with open(temporary, "w") as handle:
-    json.dump(
-        {
-            "space_id": space_id,
-            "request_source_key": "metric_views",
-            "persisted_source_key": "tables",
-            "requested_parent_path": sys.argv[3],
-            "persisted_parent_path": sys.argv[4],
-            "create_id_field": "space_id",
-            "query_attachment_id_field": "attachment_id",
-        },
-        handle,
-        indent=2,
-        sort_keys=True,
-    )
+    json.dump(state, handle, indent=2, sort_keys=True)
     handle.write("\n")
     handle.flush()
     os.fsync(handle.fileno())
-os.replace(temporary, sys.argv[2])
+os.replace(temporary, state_path)
 PY
   space_id=$(jq -er '.space_id' "$genie_state_file")
   mv "$pending_response" "$genie_state_file.create-response.json"
@@ -338,21 +322,7 @@ Do not define a native Genie bundle resource.
 ```bash
 space=$(databricks genie get-space "$space_id" \
   --include-serialized-space -o json)
-jq -e \
-  --arg warehouse_id "$warehouse_id" \
-  --arg title "$genie_title" \
-  --arg persisted_parent "$persisted_parent_path" \
-  --argjson configured "$(printf '%s\n' "${configured_sources[@]}" | jq -R . | jq -s 'sort')" '
-    .warehouse_id == $warehouse_id
-    and .title == $title
-    and .parent_path == $persisted_parent
-    and (
-      .serialized_space
-      | fromjson
-      | .version == 2
-        and (.data_sources | keys) == ["tables"]
-        and ([.data_sources.tables[].identifier] | sort) == $configured
-    )' >/dev/null <<<"$space"
+assert_space "$space"
 ```
 
 ### Complete one Conversation
@@ -391,82 +361,116 @@ generated_sql=$(jq -er '.query.query' <<<"$query_attachment")
 
 ```bash
 cat >"$sql_gate" <<'PY'
-import re, sys
+import sys
 
 sql, sources_file, mode = sys.argv[1].strip(), sys.argv[2], sys.argv[3]
-atom = r"(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_-]*)"
-identifier = rf"{atom}(?:\.{atom})*"
-atom_re = re.compile(atom)
-unquote = lambda value: value[1:-1].replace("``", "`") if value.startswith("`") else value
+WORD, NAME, SYMBOL = range(3)
 
-masked = re.sub(
-    r"'(?:''|[^'])*'|--[^\n]*|/\*.*?\*/",
-    lambda match: "".join("\n" if char == "\n" else " " for char in match.group()),
-    sql, flags=re.S,
-)
-statement = masked.rstrip()
-if statement.endswith(";"):
-    statement = statement[:-1].rstrip()
-assert ";" not in statement, "multiple or embedded statements are forbidden"
-first = re.match(r"\s*([A-Za-z]+)", statement)
-assert first and first.group(1).upper() in {"SELECT", "WITH"}, "first token must be SELECT or WITH"
-with_count = len(re.findall(r"(?i)\bWITH\b", statement))
-assert with_count == (1 if first.group(1).upper() == "WITH" else 0), "nested WITH is forbidden"
-assert not re.search(
-    r"\b(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|"
-    r"GRANT|REVOKE|CALL|COPY\s+INTO)\b",
-    statement, re.I,
-), "mutation or side-effecting SQL is forbidden"
-
-def closing_parenthesis(text, opening):
-    depth = 0
-    for index, char in enumerate(text[opening:], opening):
-        depth += (char == "(") - (char == ")")
-        if depth == 0:
-            return index
-    raise AssertionError("unclosed CTE parenthesis")
-
-def cte_aliases(text):
-    result = set()
-    with_match = re.match(r"\s*WITH\b", text, re.I)
-    if not with_match:
-        return result
-    position = with_match.end()
-    recursive = re.match(r"\s+RECURSIVE\b", text[position:], re.I)
-    position += recursive.end() if recursive else 0
-    while True:
-        alias = re.match(rf"\s*({atom})", text[position:])
-        assert alias, "invalid top-level CTE alias"
-        name = unquote(alias.group(1)).lower()
-        position += alias.end()
-        columns = re.match(r"\s*\(", text[position:])
-        if columns:
-            opening = position + columns.end() - 1
-            position = closing_parenthesis(text, opening) + 1
-        body = re.match(r"\s+AS\s*\(", text[position:], re.I)
-        assert body, "invalid top-level CTE body"
-        opening = position + body.end() - 1
-        position = closing_parenthesis(text, opening) + 1
-        result.add(name)
-        comma = re.match(r"\s*,", text[position:])
-        if not comma: break
-        position += comma.end()
+def tokenize(text):
+    result, state = [], "code"
+    index = depth = 0
+    while index < len(text):
+        char = text[index]
+        pair = text[index : index + 2]
+        if pair == "--":
+            state, index = "line", text.find("\n", index + 2)
+            index = len(text) if index < 0 else index + 1
+            state = "code"
+        elif pair == "/*":
+            state, index = "block", text.find("*/", index + 2)
+            assert index >= 0, "unclosed block comment"
+            state, index = "code", index + 2
+        elif char in {"'", '"', "`"}:
+            state, quote, value, index = "quote", char, "", index + 1
+            while index < len(text):
+                pair = text[index : index + 2]
+                if text[index] == "\\": index += 2
+                elif pair == quote * 2:
+                    value, index = value + quote, index + 2
+                elif text[index] == quote:
+                    state, index = "code", index + 1
+                    break
+                else:
+                    value, index = value + text[index], index + 1
+            assert state == "code", "unclosed quote"
+            if quote == "`": result.append((NAME, value, depth))
+        elif char.isspace(): index += 1
+        elif char == "(":
+            result.append((SYMBOL, char, depth))
+            depth, index = depth + 1, index + 1
+        elif char == ")":
+            depth -= 1
+            assert depth >= 0, "unmatched closing parenthesis"
+            result.append((SYMBOL, char, depth))
+            index += 1
+        elif char.isalpha() or char == "_":
+            end = index + 1
+            while end < len(text) and (text[end].isalnum() or text[end] in "_-"): end += 1
+            result.append((WORD, text[index:end], depth))
+            index = end
+        else:
+            result.append((SYMBOL, char, depth))
+            index += 1
+    assert depth == 0, "unclosed parenthesis"
     return result
 
-assert not re.search(
-    rf"(?i)\bFROM\s+{identifier}(?:\s+(?:AS\s+)?{atom})?\s*,",
-    statement,
-), "comma joins are forbidden"
-targets = re.findall(rf"(?i)\b(?:FROM|JOIN)\s+((?:{identifier})(?![A-Za-z0-9_@.$])|\S+)", statement)
-assert targets, "at least one FROM or JOIN target is required"
+tokens = tokenize(sql)
+assert tokens, "query is empty"
+semicolons = [index for index, token in enumerate(tokens) if token[1] == ";"]
+assert not semicolons or semicolons == [len(tokens) - 1], "multiple or embedded statements are forbidden"
+if semicolons: tokens.pop()
+is_keyword = lambda token, word: token[0] == WORD and token[1].upper() == word
+assert is_keyword(tokens[0], "SELECT") or is_keyword(tokens[0], "WITH"), "first token must be SELECT or WITH"
+assert sum(is_keyword(token, "WITH") for token in tokens) == is_keyword(tokens[0], "WITH"), "nested WITH is forbidden"
+mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY"}
+assert not any(token[0] == WORD and token[1].upper() in mutations for token in tokens), "mutation or side-effecting SQL is forbidden"
+
+def closing(opening):
+    depth = tokens[opening][2]
+    return next(index for index in range(opening + 1, len(tokens)) if tokens[index][1] == ")" and tokens[index][2] == depth)
+
+def cte_aliases():
+    aliases, openings = set(), set()
+    if not is_keyword(tokens[0], "WITH"): return aliases, openings
+    position = 1 + (len(tokens) > 1 and is_keyword(tokens[1], "RECURSIVE"))
+    while True:
+        assert tokens[position][0] in {WORD, NAME}, "invalid CTE alias"
+        aliases.add(tokens[position][1].lower())
+        position += 1
+        if tokens[position][1] == "(": position = closing(position) + 1
+        assert is_keyword(tokens[position], "AS") and tokens[position + 1][1] == "(", "invalid CTE body"
+        openings.add(position + 1)
+        position = closing(position + 1) + 1
+        if tokens[position][1] != ",": break
+        position += 1
+    assert is_keyword(tokens[position], "SELECT"), "CTEs must end in SELECT"
+    return aliases, openings
+
+aliases, cte_openings = cte_aliases()
+
+for index, token in enumerate(tokens[:-1]):
+    if token[1] == "(" and is_keyword(tokens[index + 1], "SELECT"):
+        assert index in cte_openings, "nested subquery is forbidden"
+
+terminators = {"WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY", "UNION", "EXCEPT", "INTERSECT"}
+relation_indexes = [index for index, token in enumerate(tokens) if is_keyword(token, "FROM") or is_keyword(token, "JOIN")]
+assert relation_indexes, "at least one FROM or JOIN target is required"
+for start in [index for index in relation_indexes if is_keyword(tokens[index], "FROM")]:
+    scope = tokens[start][2]
+    for token in tokens[start + 1 :]:
+        if token[2] < scope or (token[2] == scope and token[0] == WORD and token[1].upper() in terminators): break
+        assert token[2] != scope or token[1] != ",", "comma-separated relations are forbidden"
+
 allowed = {line.strip().replace("`", "") for line in open(sources_file) if line.strip()}
 assert allowed
-aliases = cte_aliases(statement)
 configured = set()
-for target in targets:
-    matches = atom_re.findall(target)
-    parts = [unquote(part) for part in matches]
-    assert parts and ".".join(matches) == target, target
+for relation in relation_indexes:
+    position, parts = relation + 1, []
+    assert tokens[position][0] in {WORD, NAME}, "invalid relation target"
+    parts.append(tokens[position][1])
+    while position + 2 < len(tokens) and tokens[position + 1][1] == "." and tokens[position + 2][0] in {WORD, NAME}:
+        parts.append(tokens[position + 2][1])
+        position += 2
     if len(parts) == 3:
         normalized = ".".join(parts)
         assert normalized in allowed, {"target": normalized, "allowed": sorted(allowed)}
@@ -474,7 +478,7 @@ for target in targets:
     elif len(parts) == 1:
         assert parts[0].lower() in aliases, {"target": parts[0], "cte_aliases": sorted(aliases)}
     else:
-        raise AssertionError(f"target must be configured FQN or CTE alias: {target}")
+        raise AssertionError(f"target must be configured FQN or CTE alias: {'.'.join(parts)}")
 assert configured, "query must read at least one configured FQN"
 outputs = {"generated": "read_only_query=true\ngrounded_sources=true", "baseline": "baseline_read_only=true"}
 assert mode in outputs, mode
@@ -483,6 +487,8 @@ PY
 python3 "$sql_gate" "$generated_sql" "$sources_file" generated
 python3 "$sql_gate" "$baseline_sql" "$sources_file" baseline
 ```
+
+The lexer tracks quote, comment, and parenthesis state, rejects relation commas at each query scope, and authorizes every `FROM` and `JOIN` target.
 
 ### Fetch and compare the exact result
 

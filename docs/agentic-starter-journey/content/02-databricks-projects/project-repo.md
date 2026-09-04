@@ -8,7 +8,8 @@ description: Create the project's own Git repo with a databricks.yml bundle and 
 
 From the workspace edge inward, every asset lives in one Databricks Asset Bundle in one Git repo, owned by one team.
 The bundle is the deployment boundary: it carries variables for catalog, schema, and warehouse per environment, so the same YAML deploys to dev, staging, and prod.
-Create the repo now, empty of resources, and validate it before adding anything. A bundle that fails `validate` with no resources is a config problem; the same failure after three resources land is a hunt.
+Create the repo now, empty of resources, and validate it before adding anything.
+A bundle that fails `validate` with no resources is a config problem; the same failure after three resources land is a hunt.
 
 ## Goal
 
@@ -19,11 +20,13 @@ A new Git repo containing a valid `databricks.yml` with dev, staging, and produc
 - Auth surface: `workspace`.
 - [Infra Setup](/docs/01-infra-setup/) complete: workspaces, a metastore, catalogs with medallion schemas, and governed object storage access.
 - A configured Databricks CLI profile that reaches the dev workspace.
-- A deployment service principal for staging and production (created during Infra Setup). Staging and prod run as this, not as a person.
+- A deployment service principal for staging and production (created during Infra Setup).
+  Staging and prod run as this, not as a person.
 
 ## Skill
 
-`databricks-dabs` (databricks-agent-skills). Read its `references/bundle-structure.md` before writing YAML.
+`databricks-dabs` (databricks-agent-skills).
+Read its `references/bundle-structure.md` before writing YAML.
 
 ## Inputs
 
@@ -98,11 +101,13 @@ Do not invoke skills, run `bundle validate`, or deploy until auth is green.
 └── .github/workflows/        added when CI lands
 ```
 
-Resource files use `<name>.<resource_type>.yml`. That naming is what `databricks-dabs` expects, and it keeps `resources/` readable once a project holds a pipeline, jobs, a dashboard, and an agent.
+Resource files use `<name>.<resource_type>.yml`.
+That naming is what `databricks-dabs` expects, and it keeps `resources/` readable once a project holds a pipeline, jobs, a dashboard, and an agent.
 
 ### 2. The bundle
 
-Parameterize catalog, schema, and warehouse as variables. Hardcoding them into resources is what makes a bundle undeployable to a second environment.
+Parameterize catalog, schema, and warehouse as variables.
+Hardcoding them into resources is what makes a bundle undeployable to a second environment.
 
 ```yaml
 # databricks.yml
@@ -165,7 +170,8 @@ databricks bundle validate --strict --target dev --profile <name>
 git add -A && git commit -m "Bundle scaffold with dev, staging, prod targets"
 ```
 
-`--strict` is the point. Without it, unknown keys pass silently and surface as a confusing deploy failure later.
+`--strict` is the point.
+Without it, unknown keys pass silently and surface as a confusing deploy failure later.
 
 ## Verify
 
@@ -191,7 +197,8 @@ staging: OK
 prod: OK
 ```
 
-A `FAIL` on staging or production here is usually the service principal not existing or not having workspace access, not a YAML error. Run `databricks bundle validate --target staging` and read the message rather than guessing.
+A `FAIL` on staging or production here is usually the service principal not existing or not having workspace access, not a YAML error.
+Run `databricks bundle validate --target staging` and read the message rather than guessing.
 
 ## Where this fails
 

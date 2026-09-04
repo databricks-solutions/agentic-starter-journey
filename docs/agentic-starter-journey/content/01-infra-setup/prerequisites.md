@@ -16,7 +16,8 @@ Report what passed and what failed with the fix for each.
 
 ## Prerequisites
 
-None. This is the first page.
+None.
+This is the first page.
 Auth surface: `account` plus cloud CLI for the target cloud.
 This page is the bootstrap auth check.
 
@@ -46,15 +47,17 @@ Ambiguous targets alone (workspace URL, bucket name, display name) are insuffici
 ```bash
 # 0. Live identity must match human-named account ids (hard stop on mismatch)
 databricks auth profiles -o json \
-  | jq -r --arg p "<account-profile>" '.[] | select(.name==$p) | "\(.name)\tValid=\(.valid)\taccount_id=\(.account_id // "unknown")"'
+  | jq -r --arg p "<account-profile>" '.profiles[] | select(.name==$p) | "\(.name)\tValid=\(.valid)\taccount_id=\(.account_id // "unknown")"'
 
-LIVE_DB_ACCOUNT=$(databricks account workspaces list --profile <account-profile> -o json \
-  | jq -r 'if length > 0 then .[0].account_id else empty end')
-# If the account has no workspaces yet, read account_id from auth profiles or account metastores list.
-test -n "$LIVE_DB_ACCOUNT" || LIVE_DB_ACCOUNT=$(databricks account metastores list --profile <account-profile> -o json \
-  | jq -r '.[0].account_id // empty')
+LIVE_DB_ACCOUNT=$(databricks auth profiles -o json \
+  | jq -er --arg p "<account-profile>" '
+      [.profiles[] | select(.name == $p and .valid == true)]
+      | select(length == 1)
+      | .[0].account_id
+      | select(type == "string" and length > 0)')
 test "$LIVE_DB_ACCOUNT" = "<databricks-account-id>" \
   || { echo "BLOCKED: Databricks account id mismatch (live=$LIVE_DB_ACCOUNT expected=<databricks-account-id>)"; exit 1; }
+databricks account workspaces list --profile <account-profile> -o json >/dev/null
 
 # AWS
 aws sts get-caller-identity --profile <cloud-profile> --query Account --output text
@@ -126,12 +129,14 @@ databricks auth profiles
 Expected: the account-admin profile row shows `Valid` = `YES` and the account host for that cloud.
 
 ```bash
-databricks account workspaces list --profile <account-profile> -o json \
-  | jq -r 'if length > 0 then .[0].account_id else "no workspaces yet" end'
+databricks auth profiles -o json \
+  | jq -er --arg p "<account-profile>" '
+      [.profiles[] | select(.name == $p and .valid == true)]
+      | select(length == 1)
+      | .[0].account_id'
 ```
 
-Expected: prints `<databricks-account-id>`, or `no workspaces yet` when the account is empty.
-In the empty case, `databricks auth profiles` must still show the same account id for `<account-profile>`.
+Expected: prints `<databricks-account-id>`.
 
 ```bash
 aws sts get-caller-identity --profile <cloud-profile> --query Account --output text   # AWS
@@ -146,7 +151,8 @@ A mismatch with the human-named id is a hard failure; stop with the remediation 
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
 ```
 
-Expected: a number (zero or more). An auth error means the account profile is wrong.
+Expected: a number (zero or more).
+An auth error means the account profile is wrong.
 
 Do not run `databricks clusters list` against an account-host profile.
 That check belongs after a workspace profile exists.
@@ -160,7 +166,8 @@ find ~/.claude/skills ~/.cursor/skills .claude/skills .cursor/skills \
 
 Expected: each prints at least one path.
 A skill is installed when its `SKILL.md` exists.
-Frontmatter `name` may be `databricks-platform-provisioning` while the directory is `platform-provisioning`. Both forms are correct.
+Frontmatter `name` may be `databricks-platform-provisioning` while the directory is `platform-provisioning`.
+Both forms are correct.
 
 Example report format:
 

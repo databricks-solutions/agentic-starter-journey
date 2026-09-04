@@ -161,10 +161,12 @@ assert_space() {
   jq -e \
     --arg warehouse_id "$warehouse_id" \
     --arg title "$genie_title" \
+    --arg description "$genie_description" \
     --arg persisted_parent "$persisted_parent_path" \
     --argjson configured "$(printf '%s\n' "${configured_sources[@]}" | jq -R . | jq -s 'sort')" '
       .warehouse_id == $warehouse_id
       and .title == $title
+      and .description == $description
       and .parent_path == $persisted_parent
       and (.serialized_space | fromjson
         | .version == 2
@@ -203,6 +205,8 @@ then
   existing=$(databricks genie get-space "$space_id" \
     --include-serialized-space -o json)
   assert_space "$existing"
+  space_etag=$(jq -er '
+    .etag | select(type == "string" and length > 0)' <<<"$existing")
   deploy_action=update
 else
   collisions=0
@@ -307,8 +311,9 @@ then
     --arg warehouse_id "$warehouse_id" \
     --arg title "$genie_title" \
     --arg description "$genie_description" \
+    --arg etag "$space_etag" \
     --arg serialized_space "$serialized_space" \
-    '{warehouse_id:$warehouse_id,title:$title,description:$description,serialized_space:$serialized_space}')
+    '{warehouse_id:$warehouse_id,title:$title,description:$description,etag:$etag,serialized_space:$serialized_space}')
   databricks genie update-space "$space_id" \
     --json "$update_request" -o json
 fi

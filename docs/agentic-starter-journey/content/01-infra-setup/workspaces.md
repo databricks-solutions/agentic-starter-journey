@@ -6,10 +6,12 @@ description: Provision Databricks workspaces with databricks-platform-provisioni
 
 ## Mental Model
 
-A workspace is the compute entry point. It cannot change region or merge with another after creation, so the layout is a one-way decision.
+A workspace is the compute entry point.
+It cannot change region or merge with another after creation, so the layout is a one-way decision.
 Databricks manages workspaces through Terraform, not the console wizard.
 `databricks-platform-provisioning` writes that Terraform from the requirements and runs `plan`, then stops for a human approval before `apply`.
-Default to three workspaces (dev, staging, prod). One workspace is fine for a POC.
+Default to three workspaces (dev, staging, prod).
+One workspace is fine for a POC.
 
 Two topologies:
 
@@ -31,10 +33,14 @@ One workspace per environment in the chosen topology, plus a Unity Catalog metas
 
 ## Skill
 
-`databricks-platform-provisioning` (ai-platform-kit). Read its `SKILL.md`, then the file for the target cloud only. Reading the other clouds' files adds noise.
+`databricks-platform-provisioning` (ai-platform-kit).
+Read its `SKILL.md`, then the file for the target cloud only.
+Reading the other clouds' files adds noise.
 
 For AWS serverless, use the skill's serverless / no-customer-VPC path (field scenario `aws-serverless-ncc`), not a BYOVPC template.
-For Azure serverless, azurerm may not expose `computeMode=Serverless` yet. Use `az databricks workspace create --compute-mode Serverless` (or azapi) until the skill documents a Terraform path. Classic Azure uses VNet injection templates.
+For Azure serverless, azurerm may not expose `computeMode=Serverless` yet.
+Use `az databricks workspace create --compute-mode Serverless` (or azapi) until the skill documents a Terraform path.
+Classic Azure uses VNet injection templates.
 
 ## Inputs
 
@@ -65,13 +71,16 @@ Per-cloud provider auth:
 | GCP | `auth_type = "google-id"` with service account impersonation | The service account, with impersonation rights. |
 
 :::danger
-The OAuth secret (AWS) is displayed once. Do not write it to a file in the repo, and do not echo it back. Pass it through environment variables only.
+The OAuth secret (AWS) is displayed once.
+Do not write it to a file in the repo, and do not echo it back.
+Pass it through environment variables only.
 :::
 
 :::danger
 Azure: the Azure AD tenant of `az account show` must be the tenant that owns the Databricks account.
 Mismatch shows as `IncorrectClaimException` (expected iss ≠ actual iss) or a workspace that never appears under `databricks account workspaces list`.
-Resolve account ID ↔ AAD tenant ID ↔ subscription ID before plan. Refuse to continue on mismatch.
+Resolve account ID ↔ AAD tenant ID ↔ subscription ID before plan.
+Refuse to continue on mismatch.
 :::
 
 ## Run
@@ -87,7 +96,7 @@ Run live checks:
 databricks auth profiles
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
 aws sts get-caller-identity --profile <aws-profile>     # AWS: Account must equal named cloud account id
-az account show --profile <azure-profile>                  # Azure: tenant + subscription must match named ids
+az account show                                             # Azure: tenant + subscription must match named ids
 gcloud auth list                                           # GCP: active account must match named project
 ```
 
@@ -117,17 +126,22 @@ databricks auth profiles          # never echoes secrets
 terraform version                 # >= 1.9.0
 ```
 
-A stale `DATABRICKS_HOST` or `DATABRICKS_TOKEN` in the shell is the most common cause of a confusing provider auth failure. Unset them.
+A stale `DATABRICKS_HOST` or `DATABRICKS_TOKEN` in the shell is the most common cause of a confusing provider auth failure.
+Unset them.
 Prefer one-shot `env VAR=... cmd` over exporting SP secrets into the shell for the rest of the session.
 
-Azure only: confirm `az group create` would succeed on the target subscription (Contributor or equivalent). Do not trust a precheck `OK` that only reflects view-only policy.
+Azure only: confirm `az group create` would succeed on the target subscription (Contributor or equivalent).
+Do not trust a precheck `OK` that only reflects view-only policy.
 
 ### 2. Naming (mandatory before HCL)
 
 Organizations disagree on Databricks vs cloud names.
 Workspace name, resource prefix, root bucket, and IAM name stems are different strings that must stay consistent inside one Terraform apply.
 
-Present at most three options in one message. Wait for an explicit pick. Then map the pick to skill/Terraform inputs. Do not fill templates before the pick.
+Present at most three options in one message.
+Wait for an explicit pick.
+Then map the pick to skill/Terraform inputs.
+Do not fill templates before the pick.
 
 Example options (adapt labels to the customer; keep ≤3):
 
@@ -138,11 +152,13 @@ Example options (adapt labels to the customer; keep ≤3):
 | C | Exact human label (example `development`) | short unique stem for cloud resources | Workspace display name decoupled from cloud prefix. |
 
 Multi-env: apply the same pattern to staging/prod (`<prefix>-staging` / `staging-<prefix>` / human labels).
-Cloud object names (root storage, credentials) still need a globally unique stem derived from the chosen prefix. State that stem in the option table.
+Cloud object names (root storage, credentials) still need a globally unique stem derived from the chosen prefix.
+State that stem in the option table.
 
 ### 3. Permission sweep
 
-Read-only. Returns which deployment topologies the caller's cloud permissions support, before any HCL exists.
+Read-only.
+Returns which deployment topologies the caller's cloud permissions support, before any HCL exists.
 
 ```bash
 bash precheck-aws.sh      # or precheck-azure.sh / precheck-gcp.sh, from the skill's scripts/
@@ -155,9 +171,11 @@ It writes the HCL, then runs `terraform init` and `terraform plan`.
 
 ### 5. Plan review
 
-The skill stops here. Show the plan to the user and get an explicit approval before `terraform apply`.
+The skill stops here.
+Show the plan to the user and get an explicit approval before `terraform apply`.
 Resources created here cost money and are slow to unwind.
-If the human already approved apply in the task brief, run `terraform apply` and record that approval. Do not treat plan as done.
+If the human already approved apply in the task brief, run `terraform apply` and record that approval.
+Do not treat plan as done.
 
 ## Verify
 
@@ -192,8 +210,10 @@ databricks current-user me --profile <workspace-profile> -o json | jq -r '.userN
 
 Compute verification after the workspace is up:
 
-- Serverless topology: serverless SQL warehouse path only (CREATE/INSERT/SELECT/DROP on a UC table once catalogs exist). Skip classic clusters.
-- Classic topology: classic cluster and serverless SQL as in `databricks-deployment-verification`. Start the classic cluster early; cold start is 10 to 15 minutes.
+- Serverless topology: serverless SQL warehouse path only (CREATE/INSERT/SELECT/DROP on a UC table once catalogs exist).
+  Skip classic clusters.
+- Classic topology: classic cluster and serverless SQL as in `databricks-deployment-verification`.
+  Start the classic cluster early; cold start is 10 to 15 minutes.
 
 On Azure, workspace admin for the creator is often automatic via Azure AD. `databricks_mws_permission_assignment` does not work on Azure; do not use it there.
 

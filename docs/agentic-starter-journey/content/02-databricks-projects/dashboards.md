@@ -332,6 +332,7 @@ jq -e '
   ]' "$dashboard_source" >/dev/null
 python3 - "$dashboard_source" <<'PY'
 import json
+import re
 import sys
 
 def tokens(sql):
@@ -409,26 +410,39 @@ dashboard = json.load(open(sys.argv[1]))
 for dataset in dashboard["datasets"]:
     sql = "".join(dataset["queryLines"])
     parsed = tokens(sql)
-    from_indexes = [
-        index
+    indexed_words = "\n".join(
+        f"{index}:{token[1]}"
         for index, token in enumerate(parsed)
-        if token[0] == "word" and token[1].upper() == "FROM"
-    ]
-    assert len(from_indexes) == 1, {
+        if token[0] == "word"
+    )
+    from_tokens = re.findall(
+        r"(?im)^(\d+):FROM$",
+        indexed_words,
+    )
+    assert len(from_tokens) == 1, {
         "dataset": dataset["name"],
-        "from_count": len(from_indexes),
+        "from_count": len(from_tokens),
     }
-    from_index = from_indexes[0]
-    assert from_index + 1 < len(parsed), dataset["name"]
-    table_kind, table_token = parsed[from_index + 1]
-    assert table_kind in {"word", "identifier"}, {
-        "dataset": dataset["name"],
-        "table_token": table_token,
-    }
-    assert "." not in table_token.replace("``", ""), {
-        "dataset": dataset["name"],
-        "table_token": table_token,
-    }
+    from_index = int(from_tokens[0])
+    join_tokens = re.findall(r"(?im)^(\d+):JOIN$", indexed_words)
+    for relation_index in [from_index, *map(int, join_tokens)]:
+        assert relation_index + 1 < len(parsed), dataset["name"]
+        table_kind, table_token = parsed[relation_index + 1]
+        assert table_kind in {"word", "identifier"}, {
+            "dataset": dataset["name"],
+            "table_token": table_token,
+        }
+        assert "." not in table_token.replace("``", ""), {
+            "dataset": dataset["name"],
+            "table_token": table_token,
+        }
+        assert (
+            relation_index + 2 == len(parsed)
+            or parsed[relation_index + 2][1] != "."
+        ), {
+            "dataset": dataset["name"],
+            "table_token": table_token,
+        }
     suffix = parsed[from_index + 2 :]
     assert (
         not suffix
@@ -461,7 +475,10 @@ do
   sql=$(dataset_sql "src/<dashboard_key>.lvdash.json" "$dataset")
   baseline_file="$baseline_dir/$dataset.json"
   run_sql "$sql" \
-    | jq -eS '{
+    | jq -eS '
+      select((.manifest.truncated // false) == false)
+      | select((.result.next_chunk_internal_link // "") == "")
+      | {
         columns: [.manifest.schema.columns[].name],
         rows: (.result.data_array | sort),
         row_count: .manifest.total_row_count
@@ -613,7 +630,10 @@ do
   sql=$(dataset_sql "$deployed_dashboard" "$dataset")
   deployed_baseline_file="$deployed_baseline_dir/$dataset.json"
   run_sql "$sql" \
-    | jq -eS '{
+    | jq -eS '
+      select((.manifest.truncated // false) == false)
+      | select((.result.next_chunk_internal_link // "") == "")
+      | {
         columns: [.manifest.schema.columns[].name],
         rows: (.result.data_array | sort),
         row_count: .manifest.total_row_count
@@ -650,6 +670,7 @@ Expected: identity, duplicate, publish, and serialization checks report true, an
 | A widget returns the wrong field | Its selected fields and encodings do not match expected dataset columns | Restore the exact field bindings from Inputs |
 | Theme validation fails | A required key is missing or renamed | Restore the complete theme contract before querying |
 | A local baseline is empty | The SQL, metric view, namespace, or warehouse is wrong | Repair the source query or target before deployment |
+| A dataset result is truncated or paginated | The inline response does not contain the complete dataset | Narrow the dataset query or add complete chunk retrieval before comparing it |
 | Strict bundle validation or deployment fails | The native resource, source path, or namespace is invalid | Restore the resource shape and validate again |
 | Effective name differs from the configured name | The development target applies a name prefix | Use the configured source name for exact duplicate matching and bundle summary for the effective API name |
 | Identity assertion fails | Deployment replaced an existing bundle-managed dashboard | Stop and reconcile bundle state before publishing |

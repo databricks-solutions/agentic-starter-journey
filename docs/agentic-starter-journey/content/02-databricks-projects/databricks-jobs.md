@@ -247,7 +247,8 @@ jq -e \
       and ($tasks[] | select(.task_key == "validate_output")
            | .run_if == "ALL_SUCCESS"
              and .depends_on == [{"task_key":"refresh_pipeline"}]
-             and .sql_task.warehouse_id == $warehouse_id)' \
+             and .sql_task.warehouse_id == $warehouse_id
+             and (.sql_task.file.path | endswith("/src/<validation_sql_filename>")))' \
   >/dev/null <<<"$dag_settings"
 ```
 

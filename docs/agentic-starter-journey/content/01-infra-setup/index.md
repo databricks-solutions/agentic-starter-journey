@@ -13,7 +13,10 @@ Everything here lives outside any project repo, at the account and metastore lay
 
 ## Run in this order
 
-The order is load-bearing. Prerequisites must pass before workspaces can be created. Workspaces must exist before catalogs. Catalogs must exist before governed object storage access.
+The order is load-bearing.
+Prerequisites must pass before workspaces can be created.
+Workspaces must exist before catalogs.
+Catalogs must exist before governed object storage access.
 
 | Order | Page | Skill |
 |---|---|---|

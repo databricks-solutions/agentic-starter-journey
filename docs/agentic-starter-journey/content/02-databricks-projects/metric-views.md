@@ -411,7 +411,7 @@ jq -e \
   --argjson expected "$expected_display_names_json" \
   --arg join_mode "$join_mode" \
   --arg join_expression \
-    '"on": source.<fact_join_key> = <join_name>.<join_key>' '
+    "'on': source.<fact_join_key> = <join_name>.<join_key>" '
     .result.data_array
     | select(length == 1)
     | .[0][0]
@@ -429,7 +429,7 @@ jq -e \
         and (
           if $join_mode == "joined"
           then ($description.view_text | contains($join_expression))
-          else ($description.view_text | contains("\"joins\"") | not)
+          else ($description.view_text | contains("\njoins:") | not)
           end
         )
       )' >/dev/null <<<"$metadata"

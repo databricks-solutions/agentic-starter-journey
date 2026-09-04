@@ -52,19 +52,12 @@ Invoke these verified skills in order:
 | Decimal tolerance | Human-provided | Provide the maximum accepted absolute difference for each decimal measure |
 | Exact-measure comparison policy | Human-provided | Identify measures that must use null-safe exact equality |
 | Join mode as `METRIC_JOIN_MODE` | Human-provided | Set exactly `none` or `joined` |
-| Join source FQN | Human-provided | Required for `joined`; not applicable for `none` |
-| Join alias | Human-provided | Required for `joined`; not applicable for `none` |
-| Join type | Human-provided | Set `left` for `joined`; not applicable for `none` |
-| Fact join key | Human-provided | Required for `joined`; not applicable for `none` |
-| Dimension join key | Human-provided | Required for `joined`; not applicable for `none` |
-| Join-key non-null policy | Human-provided | Set `reject` for both key sides in `joined`; not applicable for `none` |
-| Dimension-key uniqueness policy | Human-provided | Set `reject` for duplicate dimension keys in `joined`; not applicable for `none` |
+| Joined relation | Human-provided | For `joined`, provide the source FQN, alias, `left` join type, fact key, and dimension key; not applicable for `none` |
+| Joined key policies | Human-provided | For `joined`, reject null keys on both sides and duplicate dimension keys; not applicable for `none` |
 | `UNMATCHED_ROW_POLICY` | Human-provided | Use `reject` by default for `joined`; set `accept` only when this row explicitly records acceptance of unmatched fact rows and that their joined dimensions become null; not applicable for `none` |
 | Required source columns | Agent-derived | Derive from all selected dimension, measure, and join expressions |
 | Source and key quality | Agent-derived | Run the column, null-key, uniqueness, and unmatched-row checks before writing DDL |
-| Target catalog | Agent-derived | Read `.variables.catalog.value` from strict bundle validation |
-| SQL warehouse ID | Agent-derived | Read `.variables.warehouse_id.value` from strict bundle validation |
-| Metric-view FQN | Agent-derived | Combine the active catalog, target schema, and metric-view name |
+| Resolved target | Agent-derived | Read catalog and warehouse ID from strict bundle validation, then combine the catalog, target schema, and metric-view name into the FQN |
 | Raw baseline SQL | Agent-derived | Translate the dimensions, measures, grain, and selected join branch into independent raw SQL |
 
 For `join_mode=none`, every join-specific input is not applicable and the DDL must not contain a `joins:` block.
@@ -407,6 +400,21 @@ Then require positive semantic rows with no null dimensions or measures.
 ```bash
 root_joins_pattern='(?m)^joins:[ \t]*$'
 join_on_pattern="(?m)^    ['\"]on['\"]: source[.]<fact_join_key> = <join_name>[.]<join_key>[ \t]*$"
+metric_cte=$(cat <<SQL
+metric AS (
+  SELECT
+    <dimension_one>,
+    <dimension_two>,
+    <dimension_three>,
+    MEASURE(<measure_one>) AS <measure_one>,
+    MEASURE(<measure_two>) AS <measure_two>,
+    MEASURE(<measure_three>) AS <measure_three>,
+    1 AS row_present
+  FROM $metric_view_fqn
+  GROUP BY ALL
+)
+SQL
+)
 metadata=$(
   run_sql "DESCRIBE TABLE EXTENDED $metric_view_fqn AS JSON"
 )
@@ -441,17 +449,7 @@ jq -e \
       )' >/dev/null <<<"$metadata"
 
 semantic_statement=$(cat <<SQL
-WITH metric AS (
-  SELECT
-    <dimension_one>,
-    <dimension_two>,
-    <dimension_three>,
-    MEASURE(<measure_one>) AS <measure_one>,
-    MEASURE(<measure_two>) AS <measure_two>,
-    MEASURE(<measure_three>) AS <measure_three>
-  FROM $metric_view_fqn
-  GROUP BY ALL
-)
+WITH $metric_cte
 SELECT
   count(*) AS metric_rows,
   count_if(
@@ -520,18 +518,7 @@ SQL
 fi
 
 reconciliation_statement=$(cat <<SQL
-WITH metric AS (
-  SELECT
-    <dimension_one>,
-    <dimension_two>,
-    <dimension_three>,
-    MEASURE(<measure_one>) AS <measure_one>,
-    MEASURE(<measure_two>) AS <measure_two>,
-    MEASURE(<measure_three>) AS <measure_three>,
-    1 AS row_present
-  FROM $metric_view_fqn
-  GROUP BY ALL
-),
+WITH $metric_cte,
 $raw_cte,
 validity AS (
   SELECT

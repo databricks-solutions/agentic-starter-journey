@@ -1,283 +1,315 @@
 ---
-description: Add the governed Bakehouse franchise_sales_metrics metric view to the existing bundle and reconcile every measure against raw SQL.
+description: Deploy a governed metric view over project-selected sources and reconcile every semantic result with raw SQL.
 ---
 
 # Metric Views
 
 ## Mental Model
 
-A metric view stores governed semantic YAML and computes measures at query time instead of storing pre-aggregated rows.
-This page consumes the successful Spark Declarative Pipelines outcome in `bakehouse_silver`.
-Metric views are not native bundle resource types.
-The existing bundle deploys committed metric-view DDL through an unscheduled SQL job.
+A metric view stores governed dimensions and measures as YAML 1.1 over one source and an optional verified many-to-one join.
+Select the no-join or joined branch from the requested definition, then deploy its DDL through an unscheduled bundle SQL job.
 
 ## Goal
 
-Create `<catalog>.bakehouse_gold.franchise_sales_metrics` from `bakehouse_silver.transactions_clean` joined to `bakehouse_silver.franchises_clean`.
-Expose `franchise`, `sales_date`, and `product` dimensions and `total_sales`, `order_count`, and `avg_order_value` measures.
-Reconcile every semantic aggregate against equivalent raw SQL.
+Deploy one governed metric view and reconcile every semantic result with equivalent raw SQL.
 
 ## Prerequisites
 
-- Auth surface: `workspace`.
-- Complete the [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/) outcome.
-- Use an existing bundle project with a `dev` target.
-- Confirm the deployment principal can read both Bakehouse silver materialized views and create the `bakehouse_gold` schema and metric view.
-- Use a running SQL warehouse that supports metric views and that the deployment principal can use.
+- Complete [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/).
+- Provide read access to every selected source.
+- Provide create privileges on the target schema.
+- Provide a SQL warehouse compatible with YAML 1.1 metric views.
+- Install Databricks CLI v1.1.0 or newer.
 
 ## Skill
 
-Read these verified upstream skills in this order, but invoke them only after the auth precheck passes:
+Invoke these verified skills in order:
 
-1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core).
-2. [`databricks-metric-views`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-metric-views).
-3. [`databricks-dbsql`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dbsql).
-4. [`databricks-jobs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-jobs).
-5. [`databricks-dabs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dabs).
+1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core)
+2. [`databricks-metric-views`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-metric-views)
+3. [`databricks-dbsql`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dbsql)
+4. [`databricks-jobs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-jobs)
+5. [`databricks-dabs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dabs)
 
 ## Inputs
 
 | Input | Source | How to obtain |
 |---|---|---|
-| Databricks account ID | Human-provided | Use the account ID named for this deployment |
-| Workspace ID | Human-provided | Use the workspace ID named for this deployment |
-| Workspace host | Human-provided | Use the named `https://<deployment>.cloud.databricks.com` host |
-| Workspace CLI profile | Human-provided | Use the named profile for the target workspace |
-| Existing project path | Human-provided | Use the bundle project completed on the Project repo page |
-| Target catalog | Agent-derived | Read the existing bundle target's `catalog` variable |
-| SQL warehouse ID | Agent-derived | Read the active bundle target's `warehouse_id`; if missing, select one running compatible warehouse, write it into the active target, and use that exact value for the SQL task and `run_sql` |
+| Databricks target | Human-provided | Provide `DATABRICKS_ACCOUNT_ID`, `DATABRICKS_WORKSPACE_ID`, `DATABRICKS_HOST`, and the matching `DATABRICKS_CONFIG_PROFILE` |
+| Existing bundle project path as `PROJECT_PATH` | Human-provided | Use the project completed on the Spark Declarative Pipelines page |
+| Metric-view identity | Human-provided | Choose the job key and matching SQL filename, governed view name, and target schema |
+| Fact source FQN | Human-provided | Provide the cleaned three-part source name |
+| Dimension definitions | Human-provided | Provide names, display names, expressions, comments, and required columns |
+| Measure definitions | Human-provided | Provide names, display names, aggregates, comments, and required columns |
+| Reconciliation policy | Human-provided | Provide dimension grain, decimal tolerances, and exact measures |
+| Join definition | Human-provided | Set `METRIC_JOIN_MODE` to `none` or `joined`; for `joined`, provide the source FQN, alias, `left` type, fact key, and dimension key |
+| Join quality | Human-provided | For `joined`, require nonnull keys, unique dimension keys, and zero unmatched fact rows |
+| Derived verification | Agent-derived | Resolve catalog, warehouse, FQN, and required columns; check source and key quality; translate the selected definition into raw baseline SQL |
+
+For `join_mode=none`, every join-specific input is not applicable and the DDL must not contain a `joins:` block.
+For `join_mode=joined`, reject every unmatched fact row.
 
 ## Run
 
-### 0. Verify the auth target
+Run every shell block in Run and Verify in the same Bash shell so fail-closed options, resolved variables, and helpers persist.
 
-Refuse to continue if the human has not provided the account ID, workspace ID, workspace host, workspace CLI profile, and existing project path.
+### 0. Verify auth and resolve the active target
 
-```bash
-databricks auth profiles
-
-auth_target=$(
-  databricks auth describe --profile <workspace-profile> -o json \
-    | jq -ce '{
-        host: (.host // .details.host),
-        account_id: (.account_id // .details.configuration.account_id.value),
-        workspace_id: (.workspace_id // .details.configuration.workspace_id.value)
-      }
-      | select(
-          .host != null
-          and .account_id != null
-          and .workspace_id != null
-          and .host == "<workspace-host>"
-          and .account_id == "<databricks-account-id>"
-          and (.workspace_id | tostring) == "<workspace-id>"
-        )'
-) || {
-  printf '%s\n' 'blocked: auth preflight failed' >&2
-  exit 1
-}
-
-printf '%s\n' "$auth_target"
-
-databricks current-user me --profile <workspace-profile> -o json \
-  | jq -e '{id, userName}'
-```
-
-Expected: the profile is valid, the projection contains no null values, every projected target equals the human-provided value, and `current-user me` succeeds.
-If the projection fails, inspect the raw `auth describe` response.
-Use only the already collected workspace profile and host to remediate with `databricks auth login --host <workspace-host> --profile <workspace-profile>`.
-Do not select another profile or infer replacement account, workspace, or host values.
-Invoke the five skills in the listed order only after every check passes.
-
-### 1. Verify the silver sources
-
-Change to the existing project path.
-Read `warehouse_id` from the active bundle target.
-If it is missing, select one running compatible warehouse available to the deployment principal and write its ID into the active target before continuing.
-Assign the exact active target value for Statement Execution:
+Require the named target and the selected branch before reading or deploying project files:
 
 ```bash
-warehouse_id='<active-target-warehouse-id>'
-test -n "$warehouse_id"
-```
-
-Define one helper that safely passes arbitrary SQL to the stable Statement Execution API, polls its statement ID, prints only successful results, and fails on every terminal error state:
-
-```bash
-cd <existing-project-path>
+set -euo pipefail
+: "${DATABRICKS_ACCOUNT_ID:?}"
+: "${DATABRICKS_WORKSPACE_ID:?}"
+: "${DATABRICKS_HOST:?}"
+: "${DATABRICKS_CONFIG_PROFILE:?}"
+: "${PROJECT_PATH:?}"
+: "${METRIC_JOIN_MODE:?}"
+cd "$PROJECT_PATH"
+auth=$(databricks auth describe --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+jq -e \
+  --arg account "$DATABRICKS_ACCOUNT_ID" \
+  --arg workspace "$DATABRICKS_WORKSPACE_ID" \
+  --arg host "$DATABRICKS_HOST" '
+    {
+      host: (.host // .details.host // .details.configuration.host.value),
+      account_id: (.account_id // .details.configuration.account_id.value),
+      workspace_id: (.workspace_id // .details.configuration.workspace_id.value | tostring)
+    }
+    | select(.host == $host and .account_id == $account and .workspace_id == $workspace)' \
+  >/dev/null <<<"$auth"
+bundle=$(databricks bundle validate --strict --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+catalog=$(jq -er '.variables.catalog.value' <<<"$bundle")
+warehouse_id=$(jq -er '.variables.warehouse_id.value' <<<"$bundle")
+metric_view_schema='<metric_view_schema>'
+metric_view_name='<metric_view_name>'
+metric_view_fqn="$catalog.$metric_view_schema.$metric_view_name"
+fact_fqn='<fact_source_fqn>'
+required_fact_columns=(
+  "<fact_dimension_column>"
+  "<date_column>"
+  "<measure_input_column>"
+)
+join_mode=$METRIC_JOIN_MODE
+case "$join_mode" in
+  none)
+    join_fqn=
+    join_name=
+    fact_join_key=
+    join_key=
+    required_join_columns=()
+    ;;
+  joined)
+    join_fqn='<join_source_fqn>'
+    join_name='<join_name>'
+    fact_join_key='<fact_join_key>'
+    join_key='<join_key>'
+    required_fact_columns+=("<fact_join_key>")
+    required_join_columns=("<join_key>" "<join_dimension_column>")
+    ;;
+  *)
+    printf 'METRIC_JOIN_MODE must be none or joined\n' >&2
+    exit 1
+    ;;
+esac
+expected_display_names_json='{
+  "<dimension_one>": "<dimension_one_display_name>",
+  "<dimension_two>": "<dimension_two_display_name>",
+  "<dimension_three>": "<dimension_three_display_name>",
+  "<measure_one>": "<measure_one_display_name>",
+  "<measure_two>": "<measure_two_display_name>",
+  "<measure_three>": "<measure_three_display_name>"
+}'
 
 run_sql() {
   local statement=$1 response statement_id state
-
-  response=$(databricks api post /api/2.0/sql/statements \
-    --profile <workspace-profile> \
-    --json "$(jq -n \
-      --arg warehouse_id "$warehouse_id" \
-      --arg statement "$statement" \
-      '{warehouse_id: $warehouse_id, statement: $statement, wait_timeout: "0s"}')") \
-    || return
+  response=$(
+    databricks api post /api/2.0/sql/statements \
+      --profile "$DATABRICKS_CONFIG_PROFILE" \
+      --json "$(jq -n \
+        --arg warehouse_id "$warehouse_id" \
+        --arg statement "$statement" \
+        '{warehouse_id:$warehouse_id,statement:$statement,wait_timeout:"0s"}')"
+  ) || return
   statement_id=$(jq -er '.statement_id' <<<"$response") || return
-
-  while :; do
+  while :
+  do
     state=$(jq -er '.status.state' <<<"$response") || return
     case "$state" in
-      SUCCEEDED)
-        printf '%s\n' "$response"
-        return 0
-        ;;
+      SUCCEEDED) printf '%s\n' "$response"; return 0 ;;
       PENDING|RUNNING)
         sleep 5
         response=$(databricks api get "/api/2.0/sql/statements/$statement_id" \
-          --profile <workspace-profile>) || return
+          --profile "$DATABRICKS_CONFIG_PROFILE") || return
         ;;
-      *)
-        jq -c '.status.error // .status' <<<"$response" >&2
-        return 1
-        ;;
+      *) jq -c '.status.error // .status' >&2 <<<"$response"; return 1 ;;
     esac
   done
 }
 ```
 
-Verify the required columns in both source schemas:
+Expected: auth matches every human-provided target, strict validation succeeds, and catalog and warehouse resolve from the active `dev` target.
+
+### 1. Verify sources and optional join quality
+
+Check required columns in every selected source.
+For the joined branch, always reject null keys and duplicate dimension keys.
+Reject every unmatched fact row.
 
 ```bash
-statement=$(cat <<'SQL'
-SELECT table_name, column_name
-FROM <catalog>.information_schema.columns
-WHERE table_schema = 'bakehouse_silver'
-  AND (
-    (table_name = 'transactions_clean'
-      AND column_name IN ('franchiseID', 'dateTime', 'product', 'totalPrice'))
-    OR
-    (table_name = 'franchises_clean'
-      AND column_name IN ('franchiseID', 'name'))
-  )
-ORDER BY table_name, column_name
+assert_columns() {
+  local source_fqn=$1
+  shift
+  local required=("$@") response required_file observed_file missing
+  response=$(run_sql "DESCRIBE TABLE $source_fqn") || return
+  required_file=$(mktemp)
+  observed_file=$(mktemp)
+  printf '%s\n' "${required[@]}" | LC_ALL=C sort -u >"$required_file"
+  jq -r '
+    .result.data_array[]?
+    | .[0]
+    | select(type == "string")
+    | select(startswith("#") | not)' <<<"$response" \
+    | LC_ALL=C sort -u >"$observed_file"
+  missing=$(comm -23 "$required_file" "$observed_file")
+  rm -f "$required_file" "$observed_file"
+  test -z "$missing" || {
+    printf 'missing columns in %s:\n%s\n' "$source_fqn" "$missing" >&2
+    return 1
+  }
+}
+
+assert_columns "$fact_fqn" "${required_fact_columns[@]}"
+if test "$join_mode" = joined
+then
+  assert_columns "$join_fqn" "${required_join_columns[@]}"
+  statement=$(cat <<SQL
+WITH duplicate_join_keys AS (
+  SELECT $join_key
+  FROM $join_fqn
+  GROUP BY $join_key
+  HAVING count(*) > 1
+),
+unmatched_fact_rows AS (
+  SELECT f.$fact_join_key
+  FROM $fact_fqn f
+  LEFT ANTI JOIN $join_fqn d
+    ON f.$fact_join_key = d.$join_key
+)
+SELECT
+  (SELECT count(*) FROM $fact_fqn WHERE $fact_join_key IS NULL) AS null_fact_keys,
+  (SELECT count(*) FROM $join_fqn WHERE $join_key IS NULL) AS null_join_keys,
+  (SELECT count(*) FROM duplicate_join_keys) AS duplicate_join_keys,
+  (SELECT count(*) FROM unmatched_fact_rows) AS unmatched_fact_rows
 SQL
 )
-
-run_sql "$statement" \
-  | jq -e '
-      [.result.data_array[] | {table: .[0], column: .[1]}]
-      | group_by(.table)
-      | map({
-          key: .[0].table,
-          value: (map(.column) | sort)
-        })
-      | from_entries
-      | select(
-          .transactions_clean == ["dateTime", "franchiseID", "product", "totalPrice"]
-          and .franchises_clean == ["franchiseID", "name"]
-        )'
+  join_quality=$(run_sql "$statement")
+  join_counts=$(jq -cer '
+    .result.data_array
+    | select(length == 1)
+    | .[0]
+    | map(tonumber)
+    | select(length == 4)' <<<"$join_quality")
+  jq -en --argjson counts "$join_counts" '
+    $counts[0] == 0
+    and $counts[1] == 0
+    and $counts[2] == 0
+    and $counts[3] == 0' >/dev/null
+  jq -en '
+    ([0, 0, 0, 0] | all(. == 0))
+    and (([0, 0, 0, 1] | all(. == 0)) | not)' >/dev/null
+  printf '%s\n' \
+    'source_columns=passed join_quality=passed unmatched_rows=0'
+else
+  printf '%s\n' 'source_columns=passed join_quality=not_applicable'
+fi
 ```
 
-Expected: `transactions_clean` contains `franchiseID`, `dateTime`, `product`, and `totalPrice`, and `franchises_clean` contains `franchiseID` and `name`.
+Expected for the joined branch: `source_columns=passed join_quality=passed unmatched_rows=0`.
 
-Verify that each franchise key is non-null and unique:
+Null keys and duplicate dimension keys always fail.
+Every unmatched row fails.
+The no-join branch prints `source_columns=passed join_quality=not_applicable`.
 
-```bash
-statement=$(cat <<'SQL'
-SELECT count(*) AS invalid_franchise_keys
-FROM (
-  SELECT franchiseID
-  FROM <catalog>.bakehouse_silver.franchises_clean
-  GROUP BY franchiseID
-  HAVING franchiseID IS NULL OR count(*) <> 1
-)
-SQL
-)
+### 2. Add exactly one YAML 1.1 metric-view DDL
 
-run_sql "$statement" \
-  | jq -e '.result.data_array[0][0] | tonumber | select(. == 0)'
-```
-
-Expected: `0`.
-
-Verify that every transaction matches a franchise:
-
-```bash
-statement=$(cat <<'SQL'
-SELECT count(*) AS unmatched_transactions
-FROM <catalog>.bakehouse_silver.transactions_clean t
-LEFT ANTI JOIN <catalog>.bakehouse_silver.franchises_clean f
-  ON t.franchiseID = f.franchiseID
-SQL
-)
-
-run_sql "$statement" \
-  | jq -e '.result.data_array[0][0] | tonumber | select(. == 0)'
-```
-
-Expected: `0`.
-Stop before writing or deploying DDL if any source check fails.
-
-### 2. Add the metric-view SQL
-
-Create `src/bakehouse_franchise_sales_metrics.metric_view.sql`:
+For `join_mode=none`, create `src/<metric_view_job_key>.metric_view.sql` with this shape:
 
 ```sql
-CREATE SCHEMA IF NOT EXISTS IDENTIFIER({{catalog}} || '.bakehouse_gold');
+CREATE SCHEMA IF NOT EXISTS IDENTIFIER({{catalog}} || '.<metric_view_schema>');
 USE CATALOG IDENTIFIER({{catalog}});
-USE SCHEMA bakehouse_gold;
+USE SCHEMA <metric_view_schema>;
 
-DECLARE OR REPLACE VARIABLE metric_view_ddl STRING DEFAULT
-'CREATE OR REPLACE VIEW franchise_sales_metrics
+CREATE OR REPLACE VIEW <metric_view_name>
 WITH METRICS
 LANGUAGE YAML
 AS $$
 version: 1.1
-comment: Governed Bakehouse franchise sales metrics.
-source: ' || current_catalog() || '.bakehouse_silver.transactions_clean
-
-joins:
-  - name: franchise_details
-    source: ' || current_catalog() || '.bakehouse_silver.franchises_clean
-    ''on'': source.franchiseID = franchise_details.franchiseID
+source: <source_fqn>
 
 dimensions:
-  - name: franchise
-    display_name: Franchise
-    expr: franchise_details.name
-    comment: Franchise display name.
-  - name: sales_date
-    display_name: Sales Date
-    expr: DATE(source.dateTime)
-    comment: Calendar date of the sale.
-  - name: product
-    display_name: Product
-    expr: source.product
-    comment: Sold Bakehouse product.
+  - name: <dimension_name>
+    display_name: <dimension_display_name>
+    expr: source.<dimension_column>
+    comment: <dimension_comment>
 
 measures:
-  - name: total_sales
-    display_name: Total Sales
-    expr: SUM(source.totalPrice)
-    comment: Total sales value.
-  - name: order_count
-    display_name: Order Count
-    expr: COUNT(1)
-    comment: Number of sales transactions.
-  - name: avg_order_value
-    display_name: Average Order Value
-    expr: AVG(source.totalPrice)
-    comment: Average value per transaction.
-$$';
-
-EXECUTE IMMEDIATE metric_view_ddl;
+  - name: <measure_name>
+    display_name: <measure_display_name>
+    expr: <measure_expression>
+    comment: <measure_comment>
+$$;
 ```
 
-The doubled SQL quotes render the YAML join key as `'on'`.
+For `join_mode=joined`, create the same file with this shape:
 
-### 3. Add the unscheduled SQL job
+```sql
+CREATE SCHEMA IF NOT EXISTS IDENTIFIER({{catalog}} || '.<metric_view_schema>');
+USE CATALOG IDENTIFIER({{catalog}});
+USE SCHEMA <metric_view_schema>;
 
-Create `resources/bakehouse_franchise_sales_metrics.job.yml`:
+CREATE OR REPLACE VIEW <metric_view_name>
+WITH METRICS
+LANGUAGE YAML
+AS $$
+version: 1.1
+source: <source_fqn>
+
+joins:
+  - name: <join_name>
+    source: <join_source_fqn>
+    'on': source.<source_join_key> = <join_name>.<dimension_join_key>
+
+dimensions:
+  - name: <dimension_name>
+    display_name: <dimension_display_name>
+    expr: <dimension_expression>
+    comment: <dimension_comment>
+
+measures:
+  - name: <measure_name>
+    display_name: <measure_display_name>
+    expr: <measure_expression>
+    comment: <measure_comment>
+$$;
+```
+
+Select exactly one DDL shape from `join_mode`.
+Both branches require YAML version 1.1 and display names.
+Only the joined branch contains `joins:` and the quoted `'on'` key.
+The service may serialize that quoted key with double quotes in persisted metadata.
+The no-join branch requires no join input.
+
+### 3. Add one unscheduled SQL job
+
+Create `resources/<metric_view_job_key>.job.yml`:
 
 ```yaml
 resources:
   jobs:
-    bakehouse_franchise_sales_metrics:
-      name: bakehouse_franchise_sales_metrics
-      description: Creates or refreshes the Bakehouse franchise sales metric view.
+    <metric_view_job_key>:
+      name: <metric_view_name>
       parameters:
         - name: catalog
           default: ${var.catalog}
@@ -286,267 +318,298 @@ resources:
           sql_task:
             warehouse_id: ${var.warehouse_id}
             file:
-              path: ../src/bakehouse_franchise_sales_metrics.metric_view.sql
+              path: ../src/<metric_view_job_key>.metric_view.sql
 ```
 
 Do not add a schedule or trigger.
-Integrate the resource into the existing bundle with these definitions:
+The resource key is a job because metric views are not native bundle resources.
 
-```yaml
-include:
-  - resources/*.yml
+### 4. Deploy, run, and poll the job
 
-variables:
-  catalog:
-    description: Unity Catalog catalog for the Bakehouse project.
-  warehouse_id:
-    description: SQL warehouse ID used to create and verify the metric view.
-```
-
-Merge only missing definitions into the existing `databricks.yml`.
-Do not replace the existing bundle configuration.
-Set target-specific `catalog` and `warehouse_id` values through the bundle's existing target structure.
-The active target's exact `warehouse_id` value must drive both `${var.warehouse_id}` in the deployed SQL task and the `warehouse_id` shell variable used by every `run_sql` verification.
-
-### 4. Deploy and run
-
-Run from the existing project repository:
+Use the Databricks CLI v1.1.0 positional forms for job and run IDs:
 
 ```bash
-databricks bundle validate --strict --target dev --profile <workspace-profile>
-databricks bundle deploy --target dev --profile <workspace-profile>
-
-job_id=$(databricks bundle summary \
-  --target dev \
-  --profile <workspace-profile> \
-  -o json \
-  | jq -er '.resources.jobs.bakehouse_franchise_sales_metrics.id | tostring')
-
+databricks bundle validate --strict --target dev --profile "$DATABRICKS_CONFIG_PROFILE"
+databricks bundle deploy --target dev --profile "$DATABRICKS_CONFIG_PROFILE" --auto-approve
+job_id=$(databricks bundle summary --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE" -o json \
+  | jq -er --arg key "<metric_view_job_key>" '.resources.jobs[$key].id | tostring')
 run_id=$(databricks jobs run-now "$job_id" \
-  --profile <workspace-profile> \
-  --no-wait \
-  -o json \
+  --profile "$DATABRICKS_CONFIG_PROFILE" --no-wait -o json \
   | jq -er '.run_id | tostring')
-```
-
-Poll that exact run until it terminates:
-
-```bash
-while :; do
+while :
+do
   run=$(databricks jobs get-run "$run_id" \
-    --profile <workspace-profile> \
-    -o json) || exit 1
-  life_cycle_state=$(jq -er '.state.life_cycle_state' <<<"$run") || exit 1
-  result_state=$(jq -r '.state.result_state // empty' <<<"$run") || exit 1
-  state_message=$(jq -r '.state.state_message // empty' <<<"$run") || exit 1
-  printf 'run=%s lifecycle=%s result=%s message=%s\n' \
-    "$run_id" "$life_cycle_state" "$result_state" "$state_message"
-
-  case "$life_cycle_state" in
+    --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+  lifecycle=$(jq -er '.state.life_cycle_state' <<<"$run")
+  case "$lifecycle" in
     TERMINATED)
-      test "$result_state" = SUCCESS || exit 1
+      jq -e '.state.result_state == "SUCCESS"' >/dev/null <<<"$run"
       break
       ;;
-    INTERNAL_ERROR|SKIPPED)
-      exit 1
-      ;;
-    PENDING|RUNNING|TERMINATING|BLOCKED|WAITING_FOR_RETRY|QUEUED)
-      sleep 15
-      ;;
-    *)
-      exit 1
-      ;;
+    PENDING|RUNNING|TERMINATING|BLOCKED|WAITING_FOR_RETRY|QUEUED) sleep 10 ;;
+    *) jq '.state' >&2 <<<"$run"; exit 1 ;;
   esac
 done
 ```
 
-Expected: the exact captured run reaches `TERMINATED` with result state `SUCCESS`.
-Internal errors, skipped runs, and every other terminal outcome fail the check.
-
-Verify the deployed object type and semantic metadata:
-
-```bash
-statement=$(cat <<'SQL'
-DESCRIBE TABLE EXTENDED <catalog>.bakehouse_gold.franchise_sales_metrics AS JSON
-SQL
-)
-
-run_sql "$statement" \
-  | jq -e '
-      .result.data_array[0][0]
-      | fromjson
-      | . as $description
-      | ([
-          $description.columns[]
-          | {key: .name, value: .metadata.display_name}
-        ] | from_entries) as $display_names
-      | select(
-          $description.type == "METRIC_VIEW"
-          and $display_names == {
-            franchise: "Franchise",
-            sales_date: "Sales Date",
-            product: "Product",
-            total_sales: "Total Sales",
-            order_count: "Order Count",
-            avg_order_value: "Average Order Value"
-          }
-          and (
-            $description.view_text
-            | contains("\"on\": source.franchiseID = franchise_details.franchiseID")
-          )
-        )'
-```
-
-Expected: one parsed description with type `METRIC_VIEW`, the six exact display names, and `"on": source.franchiseID = franchise_details.franchiseID` in `view_text`.
-Missing or drifted object type, column metadata, join key quoting, or join expression fails the check.
+Expected: only terminal `SUCCESS` passes.
 
 ## Verify
 
-Query all dimensions and measures:
+### Verify metadata and semantic validity
 
-```bash
-statement=$(cat <<'SQL'
-SELECT
-  franchise,
-  sales_date,
-  product,
-  MEASURE(total_sales) AS total_sales,
-  MEASURE(order_count) AS order_count,
-  MEASURE(avg_order_value) AS avg_order_value
-FROM <catalog>.bakehouse_gold.franchise_sales_metrics
-GROUP BY ALL
-SQL
-)
+Require the exact object type, display names, YAML version, and branch-specific join shape.
+Then require positive semantic rows with no null dimensions or measures.
 
-run_sql "$statement" >/tmp/bakehouse-franchise-sales-metrics.json
+Create `src/verify_metric_yaml.py` with this standard-library parser:
+
+```text
+import json, sys
+path, expected, mode, name, source, fact_key, join_key = sys.argv[1:]
+def scalar(text):
+    text = text.strip()
+    return text[1:-1].replace(text[0] * 2, text[0]) if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"" else text
+def pair(text):
+    quote = colon = None; cut, index = len(text), 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if quote == '"' and char == "\\": index += 2; continue
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote: index += 2; continue
+                quote = None
+        elif char in "'\"": quote = char
+        elif char == "#": cut = index; break
+        elif char == ":" and colon is None: colon = index
+        index += 1
+    return None if colon is None else (text[:colon].strip(), text[colon + 1:cut].strip())
+def parse(text):
+    versions, joins, active, block, item, item_indent = [], [], False, None, None, None
+    for raw in text.splitlines():
+        indent = len(raw) - len(raw.lstrip(" "))
+        if not raw.strip(): continue
+        if block is not None:
+            if indent > block: continue
+            block = None
+        body = raw[indent:]; parsed = pair(body)
+        if not parsed: continue
+        raw_key, value = parsed; key = scalar(raw_key)
+        if value and value[0] in "|>" and set(value[1:]) <= set("+-0123456789"): block = indent
+        if indent == 0:
+            active, item, item_indent = key == "joins", None, None
+            if key == "version": versions.append(scalar(value))
+            if active: joins.append([])
+        elif active and body.startswith("- "):
+            joins[-1].append({}); item, item_indent = joins[-1][-1], indent
+            raw_key, value = pair(body[2:].lstrip()) or ("", ""); key = scalar(raw_key)
+            if key: item[key] = (raw_key, scalar(value))
+        elif active and item is not None and indent == item_indent + 2:
+            if key in item: raise AssertionError(f"duplicate join key: {key}")
+            item[key] = (raw_key, scalar(value))
+    return versions, joins
+def valid(text, selected_mode):
+    versions, joins = parse(text)
+    if versions != ["1.1"]: return False
+    if selected_mode == "none": return not joins
+    if len(joins) != 1 or len(joins[0]) != 1: return False
+    entry = joins[0][0]; wanted = f"source.{fact_key} = {name}.{join_key}"
+    return entry.get("name", (None, None))[1] == name and entry.get("source", (None, None))[1] == source and entry.get("on", (None, None))[0] in {"'on'", '"on"'} and " ".join(entry.get("on", (None, ""))[1].split()) == wanted
+single = f"version: 1.1\njoins:\n  - name: {name}\n    source: {source}\n    'on': source.{fact_key} = {name}.{join_key}"
+double = single.replace("'on'", '"on"')
+wrong = single.replace(f"source.{fact_key} = {name}.{join_key}", "source.wrong = wrong.key") + f"\nnote: >\n  'on': source.{fact_key} = {name}.{join_key}"
+quoted = f'version: 1.1\nnote: "\'on\': source.{fact_key} = {name}.{join_key}"'
+block = f"version: 1.1\nnote: |\n  'on': source.{fact_key} = {name}.{join_key}"
+assert valid(single, "joined") and valid(double, "joined")
+assert all(not valid(case, "joined") for case in [single.replace("    'on':", "    # 'on':"), quoted, block, wrong])
+assert not valid("joins:\nversion: 1.1", "none")
+description = json.load(open(path))
+display = {column["name"]: column.get("metadata", {}).get("display_name") for column in description["columns"] if column.get("metadata", {}).get("display_name") is not None}
+assert description["type"] == "METRIC_VIEW" and display == json.loads(expected) and valid(description["view_text"], mode)
 ```
 
-Expected inspection evidence: the saved full semantic query contains the dimensions and measures for every returned group.
-This saved result is inspection evidence and is not the pass or fail assertion.
-The immediately following aggregate query is the authoritative executable validity assertion for row presence, non-null dimensions and measures, positive total sales and order count, and non-negative average order value:
+The parser ignores comments, quoted scalar content, and indented literal or folded block-scalar bodies.
+Its fixtures reject each false-positive shape before live metadata is evaluated.
 
 ```bash
-statement=$(cat <<'SQL'
-WITH metric AS (
+metric_cte=$(cat <<SQL
+metric AS (
   SELECT
-    franchise,
-    sales_date,
-    product,
-    MEASURE(total_sales) AS total_sales,
-    MEASURE(order_count) AS order_count,
-    MEASURE(avg_order_value) AS avg_order_value
-  FROM <catalog>.bakehouse_gold.franchise_sales_metrics
+    <dimension_one>,
+    <dimension_two>,
+    <dimension_three>,
+    MEASURE(<measure_one>) AS <measure_one>,
+    MEASURE(<measure_two>) AS <measure_two>,
+    MEASURE(<measure_three>) AS <measure_three>,
+    1 AS row_present
+  FROM $metric_view_fqn
   GROUP BY ALL
 )
+SQL
+)
+metadata=$(
+  run_sql "DESCRIBE TABLE EXTENDED $metric_view_fqn AS JSON"
+)
+description_file=$(mktemp)
+jq -er '.result.data_array | select(length == 1) | .[0][0] | fromjson' \
+  >"$description_file" <<<"$metadata"
+python3 src/verify_metric_yaml.py "$description_file" \
+  "$expected_display_names_json" "$join_mode" "$join_name" "$join_fqn" \
+  "$fact_join_key" "$join_key"
+rm -f "$description_file"
+
+semantic_statement=$(cat <<SQL
+WITH $metric_cte
 SELECT
   count(*) AS metric_rows,
   count_if(
-    franchise IS NULL
-    OR sales_date IS NULL
-    OR product IS NULL
-    OR total_sales IS NULL
-    OR order_count IS NULL
-    OR avg_order_value IS NULL
-    OR total_sales <= 0
-    OR order_count <= 0
-    OR avg_order_value < 0
+    <dimension_one> IS NULL
+    OR <dimension_two> IS NULL
+    OR <dimension_three> IS NULL
+    OR <measure_one> IS NULL
+    OR <measure_two> IS NULL
+    OR <measure_three> IS NULL
   ) AS invalid_rows
 FROM metric
 SQL
 )
-
-run_sql "$statement" \
-  | jq -e '
-      .result.data_array[0] | map(tonumber)
-      | select(.[0] > 0 and .[1] == 0)'
-```
-
-Expected: `metric_rows` is greater than zero and `invalid_rows` is zero.
-
-Reconcile every semantic aggregate against equivalent raw SQL:
-
-```bash
-statement=$(cat <<'SQL'
-WITH metric AS (
-  SELECT
-    franchise,
-    sales_date,
-    product,
-    MEASURE(total_sales) AS total_sales,
-    MEASURE(order_count) AS order_count,
-    MEASURE(avg_order_value) AS avg_order_value
-  FROM <catalog>.bakehouse_gold.franchise_sales_metrics
-  GROUP BY ALL
-),
-raw AS (
-  SELECT
-    f.name AS franchise,
-    DATE(t.dateTime) AS sales_date,
-    t.product,
-    SUM(t.totalPrice) AS total_sales,
-    COUNT(1) AS order_count,
-    AVG(t.totalPrice) AS avg_order_value
-  FROM <catalog>.bakehouse_silver.transactions_clean t
-  LEFT JOIN <catalog>.bakehouse_silver.franchises_clean f
-    ON t.franchiseID = f.franchiseID
-  GROUP BY ALL
-),
-mismatches AS (
-  SELECT
-    coalesce(m.franchise, r.franchise) AS franchise,
-    coalesce(m.sales_date, r.sales_date) AS sales_date,
-    coalesce(m.product, r.product) AS product
-  FROM metric m
-  FULL OUTER JOIN raw r USING (franchise, sales_date, product)
-  WHERE m.franchise IS NULL
-     OR r.franchise IS NULL
-     OR m.total_sales IS NULL
-     OR r.total_sales IS NULL
-     OR m.order_count IS NULL
-     OR r.order_count IS NULL
-     OR m.avg_order_value IS NULL
-     OR r.avg_order_value IS NULL
-     OR abs(m.total_sales - r.total_sales) > 0.01
-     OR m.order_count <> r.order_count
-     OR abs(m.avg_order_value - r.avg_order_value) > 0.01
-)
-SELECT
-  (SELECT count(*) FROM metric) AS metric_rows,
-  (SELECT count(*) FROM raw) AS raw_rows,
-  count(*) AS mismatch_rows
-FROM mismatches
-SQL
-)
-
-run_sql "$statement" \
+run_sql "$semantic_statement" \
   | jq -e '
       .result.data_array
       | select(length == 1)
       | .[0]
       | map(tonumber)
-      | select(.[0] > 0 and .[0] == .[1] and .[2] == 0)'
+      | select(.[0] > 0 and .[1] == 0)' >/dev/null
+printf '%s\n' 'metadata=passed semantic_query=passed'
 ```
 
-Expected: the aggregate query returns exactly one row, `metric_rows` is greater than zero, `metric_rows` equals `raw_rows`, and `mismatch_rows` is zero.
+Expected: `metadata=passed semantic_query=passed`.
+
+### Reconcile semantic and raw results
+
+Build the raw baseline independently for the selected branch:
+
+```bash
+if test "$join_mode" = joined
+then
+  raw_cte=$(cat <<SQL
+raw AS (
+  SELECT
+    <joined_raw_dimension_one_expression> AS <dimension_one>,
+    <joined_raw_dimension_two_expression> AS <dimension_two>,
+    <joined_raw_dimension_three_expression> AS <dimension_three>,
+    <raw_measure_one_expression> AS <measure_one>,
+    <raw_measure_two_expression> AS <measure_two>,
+    <raw_measure_three_expression> AS <measure_three>,
+    1 AS row_present
+  FROM $fact_fqn source
+  LEFT JOIN $join_fqn <join_name>
+    ON source.<fact_join_key> = <join_name>.<join_key>
+  GROUP BY ALL
+)
+SQL
+)
+else
+  raw_cte=$(cat <<SQL
+raw AS (
+  SELECT
+    <no_join_raw_dimension_one_expression> AS <dimension_one>,
+    <no_join_raw_dimension_two_expression> AS <dimension_two>,
+    <no_join_raw_dimension_three_expression> AS <dimension_three>,
+    <raw_measure_one_expression> AS <measure_one>,
+    <raw_measure_two_expression> AS <measure_two>,
+    <raw_measure_three_expression> AS <measure_three>,
+    1 AS row_present
+  FROM $fact_fqn source
+  GROUP BY ALL
+)
+SQL
+)
+fi
+
+reconciliation_statement=$(cat <<SQL
+WITH $metric_cte,
+$raw_cte,
+validity AS (
+  SELECT
+    (SELECT count(*) FROM metric WHERE
+      <dimension_one> IS NULL
+      OR <dimension_two> IS NULL
+      OR <dimension_three> IS NULL
+      OR <measure_one> IS NULL
+      OR <measure_two> IS NULL
+      OR <measure_three> IS NULL) AS metric_null_rows,
+    (SELECT count(*) FROM raw WHERE
+      <dimension_one> IS NULL
+      OR <dimension_two> IS NULL
+      OR <dimension_three> IS NULL
+      OR <measure_one> IS NULL
+      OR <measure_two> IS NULL
+      OR <measure_three> IS NULL) AS raw_null_rows
+),
+mismatches AS (
+  SELECT 1
+  FROM metric m
+  FULL OUTER JOIN raw r
+    ON m.<dimension_one> <=> r.<dimension_one>
+   AND m.<dimension_two> <=> r.<dimension_two>
+   AND m.<dimension_three> <=> r.<dimension_three>
+  WHERE m.row_present IS NULL
+     OR r.row_present IS NULL
+     OR m.<measure_one> IS NULL
+     OR r.<measure_one> IS NULL
+     OR abs(m.<measure_one> - r.<measure_one>) > <decimal_tolerance>
+     OR NOT (m.<measure_two> <=> r.<measure_two>)
+     OR m.<measure_three> IS NULL
+     OR r.<measure_three> IS NULL
+     OR abs(m.<measure_three> - r.<measure_three>) > <decimal_tolerance>
+)
+SELECT
+  (SELECT count(*) FROM metric) AS metric_rows,
+  (SELECT count(*) FROM raw) AS raw_rows,
+  (SELECT metric_null_rows FROM validity) AS metric_null_rows,
+  (SELECT raw_null_rows FROM validity) AS raw_null_rows,
+  count(*) AS mismatch_rows
+FROM mismatches
+SQL
+)
+run_sql "$reconciliation_statement" \
+  | jq -e '
+      .result.data_array
+      | select(length == 1)
+      | .[0]
+      | map(tonumber)
+      | select(
+          .[0] > 0
+          and .[0] == .[1]
+          and .[2] == 0
+          and .[3] == 0
+          and .[4] == 0
+        )' >/dev/null
+printf '%s\n' \
+  'metric_rows>0 metric_rows=raw_rows metric_null_rows=0 raw_null_rows=0 mismatch_rows=0'
+```
+
+Expected: `metric_rows>0 metric_rows=raw_rows metric_null_rows=0 raw_null_rows=0 mismatch_rows=0`.
+
+Both raw SQL branches are independently executable.
+The result proves positive equal row counts, no nulls, configured comparisons and tolerances, and zero mismatches.
 
 ## Where this fails
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Auth precheck is blocked or target values mismatch | A required value is missing or the profile reaches another target | Use the named profile and collected host for re-login, then repeat every auth check |
-| Source schema assertion fails | A required silver column is missing or renamed | Stop and align the DDL with the confirmed pipeline contract |
-| Franchise key check is nonzero | `franchises_clean.franchiseID` is null or duplicated | Repair the silver franchise key before creating the metric view |
-| Anti join count is nonzero | Transactions reference franchises absent from `franchises_clean` | Repair the silver data or pipeline join contract before deployment |
-| DDL returns a privilege error | The principal lacks source read or target namespace privileges | Grant `USE CATALOG`, `USE SCHEMA`, `SELECT`, and the required create privileges |
-| SQL task cannot start | The warehouse is stopped, incompatible, or unavailable to the principal | Start a compatible warehouse and grant `CAN USE` |
-| DDL contains unresolved `{{catalog}}` | The job parameter or bundle variable is missing | Restore the `catalog` job parameter and target variable |
-| Job reaches a terminal non-success state | The SQL task failed, was skipped, or encountered an internal error | Inspect the exact captured run and repair its task error before retrying |
-| Metric view creation rejects the YAML | The YAML version, join, dimension, or measure definition is invalid | Compare the committed DDL with the verified metric-view syntax and rerun the job |
-| Deployed metadata assertion fails | The object type is wrong, display names or the join key drifted, or the warehouse cannot apply YAML 1.1 semantic metadata | Compare `DESCRIBE TABLE EXTENDED ... AS JSON` with the committed YAML, require one bundle and verification warehouse that supports YAML 1.1 semantic metadata, and rerun the job |
-| Reconciliation reports mismatches | The semantic and raw definitions differ | Stop downstream work and align the join and measure expressions |
+| Auth validation fails | The target is missing or mismatched | Reauthenticate the named profile and repeat the precheck |
+| Warehouse rejects DDL or queries | It is incompatible with YAML 1.1 metric views | Select a compatible warehouse and revalidate the target |
+| Creation or metadata validation fails | YAML version, display names, quoted `on` key, join entry, or expression drifted | Restore the selected YAML shape and redeploy |
+| DDL contains `{{catalog}}` | The catalog parameter is missing | Restore the parameter and target variable |
+| Source-column validation fails | An expression references a missing column | Correct the definition or source |
+| Join quality fails | Keys are null or duplicated | Repair keys before using the join |
+| Unmatched rows fail | A fact has no dimension match | Repair the source relationship before deployment |
+| Job is not successful | Its SQL task failed or was skipped | Repair the captured task error |
+| Semantic or reconciliation validation fails | Results contain nulls, unequal rows, or measure mismatches | Align source, dimensions, measures, grain, comparisons, and tolerance |
 
 ## Next
 
 - **Do next:** [Dashboards](/docs/02-databricks-projects/dashboards/)
 - **Back to section:** [Databricks Projects](/docs/02-databricks-projects/)
-- **Reference:** [Unity Catalog metric views](https://docs.databricks.com/metric-views/)

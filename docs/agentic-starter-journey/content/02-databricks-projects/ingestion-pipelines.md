@@ -6,8 +6,11 @@ description: Get data into Databricks. Auto Loader for files, databricks-lakeflo
 
 ## Mental Model
 
-Ingestion is getting data into Databricks. The path depends only on where the data already sits.
-Files in cloud storage land through Auto Loader. SaaS apps and databases land through managed connectors. Near real-time record streams land through Zerobus gRPC.
+Ingestion is getting data into Databricks.
+The path depends only on where the data already sits.
+Files in cloud storage land through Auto Loader.
+SaaS apps and databases land through managed connectors.
+Near real-time record streams land through Zerobus gRPC.
 All three paths end in governed Delta tables in Unity Catalog, so access is governed and audited in one place either way.
 
 ## Goal
@@ -24,7 +27,8 @@ Data from the source lands in a bronze Delta table in Unity Catalog, governed an
 
 ## Skill
 
-Pick by source. The decision tree below names the skill.
+Pick by source.
+The decision tree below names the skill.
 
 ## Inputs
 
@@ -95,11 +99,13 @@ Where does the data sit?
 └── Anything else                                    -> read it in the ETL pipeline
 ```
 
-If the source is not in the Lakeflow Connect connector list, do not force it. Read it in the ETL pipeline instead (next page).
+If the source is not in the Lakeflow Connect connector list, do not force it.
+Read it in the ETL pipeline instead (next page).
 
 ### 2a. Auto Loader path
 
-Invoke `databricks-pipelines` with the source path and format. The bronze dataset is a streaming table with Auto Loader.
+Invoke `databricks-pipelines` with the source path and format.
+The bronze dataset is a streaming table with Auto Loader.
 
 ```sql
 CREATE OR REFRESH STREAMING TABLE orders_bronze
@@ -107,7 +113,8 @@ AS SELECT *, _metadata.file_path AS source_file, current_timestamp() AS ingested
    FROM STREAM read_files('${source_path}', format => '<format>');
 ```
 
-`FROM STREAM read_files(...)` is what engages Auto Loader. Plain `FROM read_files(...)` is a batch query and fails with `Cannot create streaming table from batch query`.
+`FROM STREAM read_files(...)` is what engages Auto Loader.
+Plain `FROM read_files(...)` is a batch query and fails with `Cannot create streaming table from batch query`.
 
 Add the pipeline as a bundle resource, then validate and deploy to dev:
 
@@ -125,8 +132,10 @@ For on-prem SQL Server, confirm the source is reachable from serverless; if not,
 
 ### 2c. Zerobus path
 
-Invoke `databricks-zerobus-ingest`. It builds a client that ingests records directly into a Delta table via the Zerobus gRPC API, with schema validation and durability acknowledgments.
-Default to Python with JSON for a prototype, Protobuf for a production producer. Install the SDK through the job or cluster library configuration, not pip at runtime: the SDK cannot pip-install on serverless compute.
+Invoke `databricks-zerobus-ingest`.
+It builds a client that ingests records directly into a Delta table via the Zerobus gRPC API, with schema validation and durability acknowledgments.
+Default to Python with JSON for a prototype, Protobuf for a production producer.
+Install the SDK through the job or cluster library configuration, not pip at runtime: the SDK cannot pip-install on serverless compute.
 
 ## Verify
 
@@ -176,4 +185,3 @@ For Zerobus, also confirm the client received acknowledgments:
 ## Next
 
 - **Do next:** [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/)
-- **Reference:** [Lakeflow Connect](https://docs.databricks.com/aws/en/data-ingestion/ingest/), [Zerobus Ingest](https://docs.databricks.com/ingestion/zerobus-ingest)

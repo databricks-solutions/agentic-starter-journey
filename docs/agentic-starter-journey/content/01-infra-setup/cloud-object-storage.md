@@ -24,7 +24,8 @@ A storage credential plus a **read-only** external location so Databricks can li
 - `databricks metastores current` succeeds on the workspace profile.
 - Permission for the skill to create the cloud identity (IAM role / Access Connector / service account) in the customer's cloud account.
 - Caller has `CREATE STORAGE CREDENTIAL` and `CREATE EXTERNAL LOCATION` on the metastore (metastore admin has both by default).
-- Azure: User Access Administrator or Owner on the RG/subscription so Access Connector role assignments succeed. Contributor alone fails with `AuthorizationFailed` on `roleAssignments/write`.
+- Azure: User Access Administrator or Owner on the RG/subscription so Access Connector role assignments succeed.
+Contributor alone fails with `AuthorizationFailed` on `roleAssignments/write`.
 
 ## Skill
 
@@ -186,7 +187,8 @@ databricks api post /api/2.0/sql/statements --profile <workspace-profile> --json
 ```
 
 Expected: failure mentioning a read-only external location (for example `User cannot write to a read-only external location <name>`).
-Do not use catalog-scoped `CREATE TABLE ... LOCATION` as the first write probe; it can fail on catalog privileges before testing the location.
+Do not use catalog-scoped `CREATE TABLE ...
+LOCATION` as the first write probe; it can fail on catalog privileges before testing the location.
 Do not leave probe objects behind on a successful write (that would mean the location was not read-only).
 
 ## Where this fails
@@ -210,4 +212,3 @@ Do not leave probe objects behind on a successful write (that would mean the loc
 
 - **Do next:** [Databricks Projects](/docs/02-databricks-projects/)
 - **Manual fallback:** [Starter Journey: cloud object storage](https://databricks-solutions.github.io/starter-journey/docs/06-access-your-data/cloud-object-storage/)
-- **Reference:** [External locations](https://docs.databricks.com/aws/en/connect/unity-catalog/external-locations)

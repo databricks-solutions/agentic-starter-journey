@@ -6,7 +6,8 @@ description: Pick a catalog layout and create the catalogs with medallion schema
 
 ## Mental Model
 
-A catalog is the isolation boundary for data. Its layout determines every table name in the account, and changing it after a few hundred tables exist means rewriting every query that references them, so in practice it never gets changed.
+A catalog is the isolation boundary for data.
+Its layout determines every table name in the account, and changing it after a few hundred tables exist means rewriting every query that references them, so in practice it never gets changed.
 A catalog lives in one metastore, and a metastore is regional.
 Workspaces in different regions cannot share one catalog object.
 Same name in two regions means two catalogs (two storage roots).
@@ -22,9 +23,11 @@ One catalog per environment, each backed by its own object storage, with medalli
 - [Workspaces](/docs/01-infra-setup/workspaces/) complete, with a metastore in the region assigned to the workspace.
 - Auth surface: both (account profile, workspace profile, and cloud CLI for the target cloud).
 - Account-admin auth that can run `databricks account metastores list` and `databricks account groups list`.
-- Account-level groups exist. Unity Catalog cannot see workspace-local groups.
+- Account-level groups exist.
+Unity Catalog cannot see workspace-local groups.
 - Deploy principal has effective `CREATE_CATALOG`, `CREATE_STORAGE_CREDENTIAL`, and `CREATE_EXTERNAL_LOCATION` on the chosen metastore (shared metastores often lack these until granted).
-- Azure: subscription/RG rights include User Access Administrator (or Owner) so Access Connector role assignments can be written. Contributor alone is not enough.
+- Azure: subscription/RG rights include User Access Administrator (or Owner) so Access Connector role assignments can be written.
+Contributor alone is not enough.
 
 Gate before Run:
 
@@ -33,19 +36,25 @@ databricks metastores current --profile <workspace-profile> -o json | jq '{metas
 databricks account groups list --profile <account-profile> -o json | jq 'length'
 ```
 
-If either fails, stop. Do not create workspace-local groups as a substitute. Do not invoke the skill.
+If either fails, stop.
+Do not create workspace-local groups as a substitute.
+Do not invoke the skill.
 
 ## Skill
 
-`databricks-unity-catalog-setup` (ai-platform-kit). Read its `SKILL.md`, then the file for the target cloud.
+`databricks-unity-catalog-setup` (ai-platform-kit).
+Read its `SKILL.md`, then the file for the target cloud.
 
 ## Inputs
 
-The layout decision comes first. Ask:
+The layout decision comes first.
+Ask:
 
 > Does more than one business unit share this Databricks deployment, and must teams from different units be prevented from seeing each other's development data by default?
 
-No to either half: propose A. Yes to both: propose B. Do not pick for the user.
+No to either half: propose A.
+Yes to both: propose B.
+Do not pick for the user.
 
 | Input | Source | How to obtain |
 |---|---|---|
@@ -111,7 +120,8 @@ If more than one comes back, do not attach to whichever appears first.
 Report the list and let the user choose: adopt the clean one, delete the orphans, or create a distinctly named new one (`<prefix>-metastore`).
 `default_data_access_config_id` may be null; that is acceptable when catalog storage is self-managed on this page.
 
-Confirm the deploy principal can create UC objects on that metastore. If not, have a metastore admin grant `CREATE_CATALOG`, `CREATE_STORAGE_CREDENTIAL`, and `CREATE_EXTERNAL_LOCATION` before plan.
+Confirm the deploy principal can create UC objects on that metastore.
+If not, have a metastore admin grant `CREATE_CATALOG`, `CREATE_STORAGE_CREDENTIAL`, and `CREATE_EXTERNAL_LOCATION` before plan.
 
 ### 2. List existing catalogs
 
@@ -128,7 +138,10 @@ Unity Catalog catalog name and cloud storage name are independent.
 Example: catalog `ivansandbox123` can sit on `s3://ivansandbox123-euw3-catalog-…/` or on `s3://databricks-ivansandbox123-catalog-…/`.
 Do not assume the bucket equals the catalog name or the workspace prefix.
 
-Present at most three options in one message. Wait for an explicit pick. Map the pick to skill/Terraform inputs (`catalog_name`, bucket/container name, credential/location name stems). Do not fill templates before the pick.
+Present at most three options in one message.
+Wait for an explicit pick.
+Map the pick to skill/Terraform inputs (`catalog_name`, bucket/container name, credential/location name stems).
+Do not fill templates before the pick.
 
 Example options (adapt to the org; keep ≤3):
 
@@ -150,14 +163,18 @@ After schemas exist, transfer catalog and schema ownership to the account group 
 Setting `owner = group` before schema create can drop the deployer's `CREATE SCHEMA`.
 Do not leave the deploy SP as owner when Verify expects the group.
 
-`OPEN` catalogs need no `databricks_workspace_binding`. They are visible to all workspaces attached to that metastore.
-`ISOLATED` catalogs need explicit workspace bindings. Production usually uses `ISOLATED` bound only to the production workspace; dev and staging stay `OPEN`.
+`OPEN` catalogs need no `databricks_workspace_binding`.
+They are visible to all workspaces attached to that metastore.
+`ISOLATED` catalogs need explicit workspace bindings.
+Production usually uses `ISOLATED` bound only to the production workspace; dev and staging stay `OPEN`.
 
-If the human asks to attach one catalog to workspaces in different regions, create one catalog per metastore (same display name allowed). Do not promise a single cross-region catalog object.
+If the human asks to attach one catalog to workspaces in different regions, create one catalog per metastore (same display name allowed).
+Do not promise a single cross-region catalog object.
 
 ### 5. Plan review
 
-Mandatory. Get explicit approval before `apply`.
+Mandatory.
+Get explicit approval before `apply`.
 If the human already approved apply in the task brief, apply and record that approval.
 
 ## Verify
@@ -187,7 +204,8 @@ databricks catalogs get <prod-catalog> --profile <workspace-profile> -o json | j
 
 Expected: account group as catalog owner (after transfer), the duplicate-storage check silent, `<project>_bronze` / `_silver` / `_gold` listed, and `ISOLATED` on the production catalog when applicable.
 
-Then confirm data actually moves. One statement per request (semicolon-chained statements fail with `PARSE_SYNTAX_ERROR`):
+Then confirm data actually moves.
+One statement per request (semicolon-chained statements fail with `PARSE_SYNTAX_ERROR`):
 
 ```bash
 databricks api post /api/2.0/sql/statements --profile <workspace-profile> --json '{
@@ -248,4 +266,3 @@ A failure here with the metadata all correct usually means the storage credentia
 
 - **Do next:** [Cloud Object Storage access](/docs/01-infra-setup/cloud-object-storage/)
 - **Manual fallback:** [Starter Journey: data governance](https://databricks-solutions.github.io/starter-journey/docs/05-data-governance-strategy/)
-- **Reference:** [Create catalogs](https://docs.databricks.com/aws/en/catalogs/create-catalog)

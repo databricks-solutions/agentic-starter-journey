@@ -41,6 +41,8 @@ export const SECTIONS: Section[] = [
       { label: "Spark Declarative Pipelines", slug: "02-databricks-projects/etl-pipelines" },
       { label: "Metric Views", slug: "02-databricks-projects/metric-views" },
       { label: "Dashboards", slug: "02-databricks-projects/dashboards" },
+      { label: "Genie Agents", slug: "02-databricks-projects/genie-agents" },
+      { label: "Databricks Jobs", slug: "02-databricks-projects/databricks-jobs" },
     ],
   },
 ];

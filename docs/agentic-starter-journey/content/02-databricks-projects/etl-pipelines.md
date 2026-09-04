@@ -1,450 +1,539 @@
 ---
-description: bakehouse_e2e_pipeline reads samples.bakehouse and publishes governed bronze and silver materialized views with enforced expectations.
+description: Build and verify a batch Spark Declarative Pipeline from project-defined sources, datasets, and quality rules.
 ---
 
 # Spark Declarative Pipelines
 
 ## Mental Model
 
-`samples.bakehouse` is a batch source.
-Bronze preserves source rows.
-Silver applies quality rules.
-Batch inputs use materialized views and `spark.read.table`.
-The existing project DABs bundle owns and deploys the pipeline.
+A batch Spark Declarative Pipeline copies selected sources into bronze materialized views, applies grouped quality rules in silver materialized views, and is deployed as a native bundle pipeline.
 
 ## Goal
 
-Successfully update the pipeline named `bakehouse_e2e_pipeline`.
+Add a project-defined batch pipeline to the existing bundle, run one new update, and verify its materialized views and expectation counters.
 
 ## Prerequisites
 
-- Auth surface: `workspace`.
 - Complete the [Project repo](/docs/02-databricks-projects/project-repo/) outcome.
-- Use a target catalog that contains `bakehouse_bronze` and `bakehouse_silver`.
-- Confirm the deployment principal can read `samples.bakehouse`.
-- Use a SQL warehouse for verification.
+- Identify readable batch source tables and their required columns.
+- Provide writable bronze and silver schemas in the target catalog.
+- Configure workspace authentication for the intended account, workspace, and host.
+- Provide a SQL warehouse that the deployment principal can use for verification.
 
 ## Skill
 
-Read these skill names, but invoke them only after the auth precheck passes:
+Invoke these verified skills in order:
 
-1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core), the parent skill used first.
-2. [`databricks-pipelines`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-pipelines).
-3. [`databricks-dabs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dabs).
+1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core)
+2. [`databricks-pipelines`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-pipelines)
+3. [`databricks-dabs`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-dabs)
 
 ## Inputs
 
 | Input | Source | How to obtain |
 |---|---|---|
-| Existing project repository path | Human-provided | Use the repository completed on the Project repo page |
-| Target catalog | Agent-derived | Read the active bundle target's `catalog` variable |
-| Workspace profile | Human-provided | Use the named Databricks CLI profile for the target workspace |
-| Workspace host and workspace ID | Agent-derived | Read the named profile and `databricks metastores current` |
-| SQL warehouse ID | Agent-derived | Select a running warehouse available to the deployment principal |
-| Language | Agent-derived, fixed runbook decision | Use Python |
+| `DATABRICKS_ACCOUNT_ID` | Human-provided | Copy the intended Databricks account ID |
+| `DATABRICKS_WORKSPACE_ID` | Human-provided | Copy the intended workspace ID |
+| `DATABRICKS_HOST` | Human-provided | Copy the intended workspace URL |
+| `DATABRICKS_CONFIG_PROFILE` | Human-provided | Name the Databricks CLI profile for the intended workspace |
+| `PROJECT_PATH` | Human-provided | Use the local path to the completed project repository |
+| `<pipeline_key>` | Human-provided | Choose the stable bundle resource key and source directory name |
+| `<pipeline_display_name>` | Human-provided | Choose the displayed pipeline name |
+| Source FQNs | Human-provided | List each readable batch source as a three-part name |
+| Selected columns | Human-provided | List the source columns required by each dataset |
+| `<bronze_dataset>` names | Human-provided | Choose one unique bronze materialized view name per source |
+| `<silver_dataset>` names | Human-provided | Choose one unique silver materialized view name per transformed dataset |
+| `<quality_rule_name>` values | Human-provided | Choose one unique name per quality rule |
+| `<quality_rule_sql>` values | Human-provided | Provide each SQL boolean expression |
+| Quality rule actions | Human-provided | Choose `warn`, `drop`, or `fail` for each rule |
+| `catalog` | Agent-derived | Read `.variables.catalog.value` from strict bundle validation |
+| `schema_prefix` | Agent-derived | Read `.variables.schema_prefix.value` from strict bundle validation |
+| `warehouse_id` | Agent-derived | Read `.variables.warehouse_id.value` from strict bundle validation |
+| Source catalog, schema, and table components | Agent-derived | Parse all three fields from each validated human-provided source FQN |
+| Bronze schema | Agent-derived | Use `${schema_prefix}_bronze` |
+| Silver schema | Agent-derived | Use `${schema_prefix}_silver` |
+| `SOURCE_SPECS_JSON` | Agent-derived | Add redundant catalog, schema, and table fields parsed from the human-provided FQNs, then cross-check them before use |
+| `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
+| `OUTPUT_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, authored materialized-view name, and complete deployed FQN |
+| `EXPECTATION_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, materialized-view name, rule name, SQL expression, and action used for authoring |
+| File layout | Agent-derived | Put each focused dataset file under `src/<pipeline_key>/` and the resource under `resources/` |
 
 ## Run
 
-### 0. Auth precheck
-
-Refuse to continue if the brief or prior pages do not name all of these:
-
-- Databricks account id
-- Workspace id
-- Workspace host (`https://<deployment>.cloud.databricks.com`)
-- Workspace CLI profile name
+Start one persistent Bash session, then run every remaining Run and Verify block in that session.
+This preserves strict options, variables, arrays, and functions and avoids reserved-name behavior from another shell.
 
 ```bash
-databricks auth profiles
-
-databricks auth describe --profile <workspace-profile> -o json \
-  | jq -c '{
-      host: (.host // .details.host),
-      account_id: (.account_id // .details.configuration.account_id.value),
-      workspace_id: (.workspace_id // .details.configuration.workspace_id.value)
-    }'
-
-databricks current-user me --profile <workspace-profile> -o json \
-  | jq '{id, userName}'
-
-databricks metastores current --profile <workspace-profile> -o json \
-  | jq '{workspace_id, metastore_id}'
+bash
 ```
 
-Expected:
+### 1. Resolve authentication and the bundle target
 
-- `<workspace-profile>` shows `Valid` = `YES` in `auth profiles`.
-- `auth describe` prints `{"host":"https://<deployment>.cloud.databricks.com","account_id":"<databricks-account-id>","workspace_id":"<workspace-id>"}` with no null values.
-- `auth describe` `host`, `account_id`, and `workspace_id` equal the named values.
-- `current-user me` succeeds with no auth error.
-- `metastores current` `workspace_id` equals the named workspace id.
+Set all human-provided environment variables before running this block.
+The identity check fails before any file or live resource change when the profile targets another account, workspace, or host.
 
-If any projected `auth describe` value is null, inspect the raw `databricks auth describe --profile <workspace-profile> -o json` response before prescribing re-login.
-On any failure: print **blocked: auth preflight failed**, list the failing check, give the human the remediation below, and stop.
-Do not invoke skills, run `bundle validate`, or deploy until auth is green.
+```bash
+set -euo pipefail
+: "${BASH_VERSION:?Start the required persistent Bash session}"
+persistent_bash_pid=$$
+: "${DATABRICKS_ACCOUNT_ID:?}"
+: "${DATABRICKS_WORKSPACE_ID:?}"
+: "${DATABRICKS_HOST:?}"
+: "${DATABRICKS_CONFIG_PROFILE:?}"
+: "${PROJECT_PATH:?}"
+: "${SOURCE_SPECS_JSON:?}"
+: "${QUALITY_RULES_JSON:?}"
+: "${OUTPUT_MANIFEST_JSON:?}"
+: "${EXPECTATION_MANIFEST_JSON:?}"
+cd "$PROJECT_PATH"
+auth=$(databricks auth describe --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+jq -e \
+  --arg account "$DATABRICKS_ACCOUNT_ID" \
+  --arg workspace "$DATABRICKS_WORKSPACE_ID" \
+  --arg host "$DATABRICKS_HOST" '
+    {
+      host: (.host // .details.host // .details.configuration.host.value),
+      account_id: (.account_id // .details.configuration.account_id.value),
+      workspace_id: (.workspace_id // .details.configuration.workspace_id.value | tostring)
+    }
+    | select(.host == $host and .account_id == $account and .workspace_id == $workspace)' \
+  >/dev/null <<<"$auth"
+bundle=$(databricks bundle validate --strict --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+catalog=$(jq -er '.variables.catalog.value' <<<"$bundle")
+schema_prefix=$(jq -er '.variables.schema_prefix.value' <<<"$bundle")
+warehouse_id=$(jq -er '.variables.warehouse_id.value' <<<"$bundle")
+```
 
-| Check failed | Human remediation |
-|---|---|
-| Missing named account id, workspace id, host, or profile | Ask the human for all four before continuing |
-| Profile `Valid=NO` or auth error on describe | `databricks auth login --host <workspace-host> --profile <workspace-profile>` (or refresh the SP OAuth secret on the profile) |
-| Host, account id, or workspace id mismatch on `auth describe` | Inspect the raw response, then re-login the profile against the named host if the configured values are wrong; confirm the Databricks account id in the account console |
-| `workspace_id` mismatch on `metastores current` | Inspect the `workspace_id` and `host` projected by `auth describe`, align the human-named workspace ID and host with the profile, and run `databricks auth login --host <workspace-host> --profile <workspace-profile>` if they differ |
-| `current-user me` fails after profile is Valid | Workspace admin assigns the user or SP to the workspace |
+### 2. Inspect every batch source
 
-### 1. Inspect the batch source
-
-Invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
-Define one helper that waits for SQL Statement Execution to finish:
+Use this Statement Execution helper for the source precheck and later verification.
 
 ```bash
 run_sql() {
   local statement=$1 response statement_id state
-
-  response=$(databricks api post /api/2.0/sql/statements \
-    --profile <workspace-profile> \
-    --json "$(jq -n \
-      --arg warehouse_id '<warehouse-id>' \
-      --arg statement "$statement" \
-      '{warehouse_id: $warehouse_id, statement: $statement, wait_timeout: "0s"}')") \
-    || return
+  response=$(
+    databricks api post /api/2.0/sql/statements \
+      --profile "$DATABRICKS_CONFIG_PROFILE" \
+      --json "$(jq -n \
+        --arg warehouse_id "$warehouse_id" \
+        --arg statement "$statement" \
+        '{warehouse_id:$warehouse_id,statement:$statement,wait_timeout:"0s"}')"
+  ) || return
   statement_id=$(jq -er '.statement_id' <<<"$response") || return
-
-  while :; do
+  while :
+  do
     state=$(jq -er '.status.state' <<<"$response") || return
     case "$state" in
-      SUCCEEDED)
-        printf '%s\n' "$response"
-        return 0
-        ;;
+      SUCCEEDED) printf '%s\n' "$response"; return 0 ;;
       PENDING|RUNNING)
         sleep 5
         response=$(databricks api get "/api/2.0/sql/statements/$statement_id" \
-          --profile <workspace-profile>) || return
+          --profile "$DATABRICKS_CONFIG_PROFILE") || return
         ;;
-      *)
-        jq -c '.status.error // .status' <<<"$response" >&2
-        return 1
-        ;;
+      *) jq -c '.status.error // .status' >&2 <<<"$response"; return 1 ;;
     esac
   done
 }
 ```
 
-The helper prints results only for `SUCCEEDED`.
-It prints the API error and fails for every terminal failure state.
-Confirm all four source tables exist, then confirm the three expectation columns on `sales_transactions`.
+After the human provides each source FQN and its selected columns, populate `SOURCE_SPECS_JSON` with the parsed catalog, schema, and table fields.
+
+```json
+[
+  {
+    "fqn": "<catalog>.<source_schema>.<source_table>",
+    "catalog": "<catalog>",
+    "schema": "<source_schema>",
+    "table": "<source_table>",
+    "required_columns": ["<required_column_one>", "<required_column_two>"]
+  }
+]
+```
+
+Validate every redundant field against the human-provided FQN and stop before authoring when a required column is absent.
 
 ```bash
-statement=$(cat <<'SQL'
-SELECT table_name, column_name, full_data_type
-FROM samples.information_schema.columns
-WHERE table_schema = 'bakehouse'
-  AND table_name IN (
-    'sales_transactions',
-    'sales_customers',
-    'sales_franchises',
-    'sales_suppliers'
-  )
-ORDER BY table_name, column_name
+jq -e '
+  type == "array"
+  and length > 0
+  and all(.[];
+    (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$"))
+    and (.catalog | type == "string" and length > 0)
+    and (.schema | type == "string" and length > 0)
+    and (.table | type == "string" and length > 0)
+    and (.fqn == ([.catalog, .schema, .table] | join(".")))
+    and (.required_columns | type == "array" and length > 0)
+  )' >/dev/null <<<"$SOURCE_SPECS_JSON"
+source_count=$(jq 'length' <<<"$SOURCE_SPECS_JSON")
+for ((source_index = 0; source_index < source_count; source_index++))
+do
+  source_fqn=$(jq -er --argjson index "$source_index" \
+    '.[$index].fqn' <<<"$SOURCE_SPECS_JSON")
+  IFS=. read -r source_catalog source_schema source_table <<<"$source_fqn"
+  required_columns=$(mktemp)
+  observed_columns=$(mktemp)
+  jq -r --argjson index "$source_index" \
+    '.[$index].required_columns[]' <<<"$SOURCE_SPECS_JSON" \
+    | LC_ALL=C sort -u >"$required_columns"
+  statement=$(cat <<SQL
+SELECT column_name
+FROM $source_catalog.information_schema.columns
+WHERE table_schema = '$source_schema'
+  AND table_name = '$source_table'
+ORDER BY column_name
 SQL
 )
-
-run_sql "$statement" \
-  | jq -e '
-      .result.data_array as $rows
-      | {
-          tables: ([$rows[][0]] | unique),
-          transaction_columns: ([
-            $rows[]
-            | select(
-                .[0] == "sales_transactions"
-                and (.[1] == "customerID" or .[1] == "quantity" or .[1] == "franchiseID")
-              )
-            | .[1]
-          ] | sort)
-        }
-      | select(
-          (.tables | length) == 4
-          and .transaction_columns == ["customerID", "franchiseID", "quantity"]
-        )'
+  run_sql "$statement" \
+    | jq -r '.result.data_array[] | .[0]' \
+    | LC_ALL=C sort -u >"$observed_columns"
+  missing=$(comm -23 "$required_columns" "$observed_columns")
+  test -z "$missing" || {
+    printf 'missing required columns for %s:\n%s\n' \
+      "$source_fqn" "$missing" >&2
+    exit 1
+  }
+done
+printf 'source_precheck=passed sources=%s\n' "$source_count"
 ```
 
-Expected: all four source table names and all three required `sales_transactions` columns.
-Stop if `customerID`, `quantity`, or `franchiseID` is absent.
+Expected: `source_precheck=passed` with the configured positive source count.
 
-### 2. Write the pipeline source
+Define `QUALITY_RULES_JSON` with this human-provided shape.
 
-Create one file per dataset.
+```json
+[
+  {
+    "name": "<quality_rule_name>",
+    "sql": "<quality_rule_sql>",
+    "action": "warn"
+  }
+]
+```
 
-Create `src/bakehouse_pipeline/bronze/sales_transactions_raw.py`:
+Validate every rule and reject any action other than `warn`, `drop`, or `fail`.
+
+```bash
+jq -e '
+  type == "array"
+  and length > 0
+  and all(.[];
+    (.name | type == "string" and length > 0)
+    and (.sql | type == "string" and length > 0)
+    and (.action == "warn" or .action == "drop" or .action == "fail")
+  )
+  and ([.[].name] | length == (unique | length))
+  ' >/dev/null <<<"$QUALITY_RULES_JSON"
+printf 'quality_rule_precheck=passed rules=%s\n' \
+  "$(jq 'length' <<<"$QUALITY_RULES_JSON")"
+```
+
+Expected: `quality_rule_precheck=passed` with the configured positive rule count.
+
+Derive complete authoring manifests before writing any focused Python file.
+
+```json
+[
+  {"file": "bronze/<bronze_dataset>.py", "name": "<bronze_dataset>", "fqn": "<catalog>.<bronze_schema>.<bronze_dataset>"},
+  {"file": "silver/<silver_dataset>.py", "name": "<silver_schema>.<silver_dataset>", "fqn": "<catalog>.<silver_schema>.<silver_dataset>"}
+]
+```
+
+```json
+[
+  {"file": "silver/<silver_dataset>.py", "materialized_view": "<silver_schema>.<silver_dataset>", "name": "<quality_rule_name>", "sql": "<quality_rule_sql>", "action": "drop"}
+]
+```
+
+Validate both manifests and require their complete expectation set to equal the human-provided quality rules.
+
+```bash
+jq -en \
+  --argjson outputs "$OUTPUT_MANIFEST_JSON" \
+  --argjson expectations "$EXPECTATION_MANIFEST_JSON" \
+  --argjson quality "$QUALITY_RULES_JSON" '
+  ($outputs | length > 0
+    and all(.[];
+      (.file | type == "string" and endswith(".py"))
+      and (.name | type == "string" and length > 0)
+      and (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$")))
+    and ([.[].file] | length == (unique | length))
+    and ([.[].name] | length == (unique | length))
+    and ([.[].fqn] | length == (unique | length)))
+  and ($expectations | length > 0
+    and all(.[];
+      (.file | type == "string" and endswith(".py"))
+      and (.materialized_view | type == "string" and length > 0)
+      and (.name | type == "string" and length > 0)
+      and (.sql | type == "string" and length > 0)
+      and (.action | IN("warn", "drop", "fail")))
+    and ([.[] | [.file, .materialized_view, .name]] | length == (unique | length)))
+  and ($quality | sort_by(.name))
+    == ($expectations | map({name, sql, action}) | sort_by(.name))
+' >/dev/null
+```
+
+Expected: both manifests are nonempty and unique, and no quality rule is missing or added.
+Only after both prechecks pass, invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
+
+### 3. Write focused dataset files
+
+Create one bronze file for each source under `src/<pipeline_key>/bronze/`.
 
 ```python
 from pyspark import pipelines as dp
 
-@dp.materialized_view(name="sales_transactions_raw")
-def sales_transactions_raw():
-    return spark.read.table("samples.bakehouse.sales_transactions")
+@dp.materialized_view(name="<bronze_dataset>")
+def bronze_dataset():
+    return spark.read.table("<source_fqn>")
 ```
 
-Create `src/bakehouse_pipeline/bronze/sales_customers_raw.py`:
+Create one silver file for each transformed dataset under `src/<pipeline_key>/silver/`.
+Group rules by action and use the exact native decorator for that action.
 
 ```python
 from pyspark import pipelines as dp
 
-@dp.materialized_view(name="sales_customers_raw")
-def sales_customers_raw():
-    return spark.read.table("samples.bakehouse.sales_customers")
-```
-
-Create `src/bakehouse_pipeline/bronze/sales_franchises_raw.py`:
-
-```python
-from pyspark import pipelines as dp
-
-@dp.materialized_view(name="sales_franchises_raw")
-def sales_franchises_raw():
-    return spark.read.table("samples.bakehouse.sales_franchises")
-```
-
-Create `src/bakehouse_pipeline/bronze/sales_suppliers_raw.py`:
-
-```python
-from pyspark import pipelines as dp
-
-@dp.materialized_view(name="sales_suppliers_raw")
-def sales_suppliers_raw():
-    return spark.read.table("samples.bakehouse.sales_suppliers")
-```
-
-Create `src/bakehouse_pipeline/silver/transactions_clean.py`:
-
-Group the three same-action quality rules in one `expect_all_or_drop` decorator.
-
-```python
-from pyspark import pipelines as dp
-
-silver_schema = spark.conf.get("silver_schema")
-
-@dp.materialized_view(name=f"{silver_schema}.transactions_clean")
-@dp.expect_all_or_drop({
-    "valid_customer": "customerID IS NOT NULL",
-    "valid_quantity": "quantity > 0",
-    "valid_franchise": "franchiseID IS NOT NULL",
+@dp.materialized_view(name="<silver_schema>.<silver_dataset>")
+@dp.expect_all({
+    "<warn_rule_name>": "<warn_rule_sql>",
 })
-def transactions_clean():
-    return spark.read.table("sales_transactions_raw")
+@dp.expect_all_or_drop({
+    "<drop_rule_name>": "<drop_rule_sql>",
+})
+@dp.expect_all_or_fail({
+    "<fail_rule_name>": "<fail_rule_sql>",
+})
+def silver_dataset():
+    return spark.read.table("<bronze_dataset>")
 ```
 
-Create `src/bakehouse_pipeline/silver/customers_clean.py`:
+Map `warn` to `expect_all`, `drop` to `expect_all_or_drop`, and `fail` to `expect_all_or_fail`.
+Omit a decorator when that action group is empty.
+Give every dataset one focused file.
 
-```python
-from pyspark import pipelines as dp
-
-silver_schema = spark.conf.get("silver_schema")
-
-@dp.materialized_view(name=f"{silver_schema}.customers_clean")
-def customers_clean():
-    return spark.read.table("sales_customers_raw")
-```
-
-Create `src/bakehouse_pipeline/silver/franchises_clean.py`:
-
-```python
-from pyspark import pipelines as dp
-
-silver_schema = spark.conf.get("silver_schema")
-
-@dp.materialized_view(name=f"{silver_schema}.franchises_clean")
-def franchises_clean():
-    return spark.read.table("sales_franchises_raw")
-```
-
-Create `src/bakehouse_pipeline/silver/suppliers_clean.py`:
-
-```python
-from pyspark import pipelines as dp
-
-silver_schema = spark.conf.get("silver_schema")
-
-@dp.materialized_view(name=f"{silver_schema}.suppliers_clean")
-def suppliers_clean():
-    return spark.read.table("sales_suppliers_raw")
-```
-
-The default target publishes these bronze materialized views:
+Statically parse every focused Python file and require exact equality with both authoring manifests before deployment.
+Create `src/verify_pipeline_authoring.py`:
 
 ```text
-bakehouse_bronze.sales_transactions_raw
-bakehouse_bronze.sales_customers_raw
-bakehouse_bronze.sales_franchises_raw
-bakehouse_bronze.sales_suppliers_raw
+import ast, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+catalog, bronze_schema = sys.argv[2:4]
+expected_outputs = json.loads(sys.argv[4])
+expected_rules = json.loads(sys.argv[5])
+actions = {"expect_all": "warn", "expect_all_or_drop": "drop", "expect_all_or_fail": "fail"}
+actual_outputs, actual_rules = [], []
+for path in sorted(root.rglob("*.py")):
+    relative = str(path.relative_to(root))
+    tree = ast.parse(path.read_text(), filename=str(path))
+    functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for function in functions:
+        calls = [item for item in function.decorator_list if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)]
+        views = [item for item in calls if item.func.attr == "materialized_view"]
+        expectations = [item for item in calls if item.func.attr in actions]
+        if not views:
+            assert not expectations, f"expectation without materialized view: {relative}:{function.name}"
+            continue
+        assert len(views) == 1
+        values = [item.value for item in views[0].keywords if item.arg == "name"]
+        assert len(values) == 1
+        view = ast.literal_eval(values[0])
+        assert isinstance(view, str) and view
+        fqn = f"{catalog}.{view}" if "." in view else f"{catalog}.{bronze_schema}.{view}"
+        actual_outputs.append({"file": relative, "name": view, "fqn": fqn})
+        for decorator in expectations:
+            assert len(decorator.args) == 1 and not decorator.keywords
+            action, rules = actions[decorator.func.attr], ast.literal_eval(decorator.args[0])
+            assert isinstance(rules, dict) and rules
+            for name, sql in rules.items():
+                actual_rules.append({"file": relative, "materialized_view": view, "name": name, "sql": sql, "action": action})
+
+def canonical(items):
+    return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+
+def require_exact(expected, actual, label):
+    assert canonical(expected) == canonical(actual), {"contract": label, "expected": canonical(expected), "actual": canonical(actual)}
+
+require_exact(expected_outputs, actual_outputs, "materialized views")
+require_exact(expected_rules, actual_rules, "expectations")
+for expected, omitted, label in [
+    (expected_outputs, actual_outputs[:-1], "omitted materialized view fixture"),
+    (expected_rules, actual_rules[:-1], "omitted expectation fixture"),
+]:
+    try:
+        require_exact(expected, omitted, label)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"{label} passed")
+print("authoring_manifests=passed omission_fixtures=passed")
 ```
 
-The configured silver schema publishes these materialized views:
+Run the parser before deployment:
 
-```text
-bakehouse_silver.transactions_clean
-bakehouse_silver.customers_clean
-bakehouse_silver.franchises_clean
-bakehouse_silver.suppliers_clean
+```bash
+python3 src/verify_pipeline_authoring.py \
+  "src/<pipeline_key>" \
+  "$catalog" \
+  "${schema_prefix}_bronze" \
+  "$OUTPUT_MANIFEST_JSON" \
+  "$EXPECTATION_MANIFEST_JSON"
 ```
 
-### 3. Add the pipeline resource
+Expected: `authoring_manifests=passed omission_fixtures=passed`.
+Any omitted or extra materialized view, expectation rule, action, SQL expression, file, name, or FQN fails before deployment.
 
-Create `resources/bakehouse_e2e_pipeline.pipeline.yml`:
+### 4. Add the native pipeline resource
+
+Create `resources/<pipeline_key>.pipeline.yml`.
 
 ```yaml
 resources:
   pipelines:
-    bakehouse_e2e_pipeline:
-      name: bakehouse_e2e_pipeline
+    <pipeline_key>:
+      name: <pipeline_display_name>
       catalog: ${var.catalog}
-      target: bakehouse_bronze
-      root_path: ../src/bakehouse_pipeline
+      target: ${var.schema_prefix}_bronze
+      root_path: ../src/<pipeline_key>
       libraries:
         - glob:
-            include: ../src/bakehouse_pipeline/**
+            include: ../src/<pipeline_key>/**
+      configuration:
+        silver_schema: ${var.schema_prefix}_silver
       serverless: true
       continuous: false
       development: true
       photon: true
       channel: current
-      configuration:
-        silver_schema: bakehouse_silver
 ```
 
-Both paths resolve relative to the YAML file under `resources/`.
-`${var.catalog}` prevents a hardcoded workspace catalog.
-Development mode may prefix the displayed workspace pipeline name, while the resource key `bakehouse_e2e_pipeline` remains the bundle command target.
+The resource uses the bundle variables resolved in the first step and has no schedule.
 
-### 4. Deploy and run
+### 5. Deploy and resolve the pipeline ID
 
-Run from the existing project repository:
+The first deployment may create the pipeline before the baseline is captured.
 
 ```bash
-databricks bundle validate --strict --target dev --profile <workspace-profile>
-databricks bundle deploy --target dev --profile <workspace-profile>
+databricks bundle validate --strict --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE"
+databricks bundle deploy --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE" --auto-approve
+pipeline_id=$(
+  databricks bundle summary --target dev \
+    --profile "$DATABRICKS_CONFIG_PROFILE" -o json \
+  | jq -er --arg key "<pipeline_key>" '.resources.pipelines[$key].id'
+)
+```
 
-pipeline_id=$(databricks bundle summary \
-  --target dev \
-  --profile <workspace-profile> \
-  -o json \
-  | jq -er '.resources.pipelines.bakehouse_e2e_pipeline.id')
+### 6. Capture the baseline, then start one update
 
-update_id=$(databricks bundle run bakehouse_e2e_pipeline \
-  --target dev \
-  --profile <workspace-profile> \
-  --no-wait \
-  -o json \
-  | jq -er '.update_id')
+Represent a first run explicitly and reject malformed baseline responses.
+
+```bash
+baseline=$(
+  databricks pipelines list-updates "$pipeline_id" --max-results 1 \
+    --profile "$DATABRICKS_CONFIG_PROFILE" -o json
+)
+baseline_update_id=$(jq -er '
+  .updates
+  | if length == 0
+    then "__NO_PRIOR_UPDATE__"
+    elif length == 1
+    then .[0].update_id
+    else error("max-results 1 returned multiple updates")
+    end' <<<"$baseline")
+update_id=$(
+  databricks bundle run <pipeline_key> --target dev \
+    --profile "$DATABRICKS_CONFIG_PROFILE" --no-wait -o json \
+  | jq -er '.update_id'
+)
+test "$update_id" != "$baseline_update_id"
 ```
 
 ## Verify
 
-Prove the bundle update completed and all eight governed materialized views exist with the `tables get` API command:
+Poll the exact update returned by the bundle run.
+Only `COMPLETED` passes.
 
 ```bash
-while :; do
-  update=$(databricks pipelines get-update \
-    "$pipeline_id" \
-    "$update_id" \
-    --profile <workspace-profile> \
-    -o json) || exit 1
-  state=$(jq -er '.update.state' <<<"$update") || exit 1
-  printf 'update=%s state=%s\n' "$update_id" "$state"
-
+test "$persistent_bash_pid" = "$$"
+while :
+do
+  update=$(databricks pipelines get-update "$pipeline_id" "$update_id" \
+    --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+  state=$(jq -er '.update.state' <<<"$update")
   case "$state" in
-    COMPLETED)
-      break
-      ;;
-    FAILED|CANCELED)
-      jq '.update' <<<"$update" >&2
-      exit 1
-      ;;
-    *)
-      sleep 30
-      ;;
+    COMPLETED) break ;;
+    CREATED|INITIALIZING|QUEUED|RESETTING|RUNNING|SETTING_UP_TABLES|WAITING_FOR_RESOURCES|STOPPING) sleep 15 ;;
+    FAILED|CANCELED) jq '.update' >&2 <<<"$update"; exit 1 ;;
+    *) printf 'unknown update state: %s\n' "$state" >&2; exit 1 ;;
   esac
 done
+```
 
-for table in \
-  <catalog>.bakehouse_bronze.sales_transactions_raw \
-  <catalog>.bakehouse_bronze.sales_customers_raw \
-  <catalog>.bakehouse_bronze.sales_franchises_raw \
-  <catalog>.bakehouse_bronze.sales_suppliers_raw \
-  <catalog>.bakehouse_silver.transactions_clean \
-  <catalog>.bakehouse_silver.customers_clean \
-  <catalog>.bakehouse_silver.franchises_clean \
-  <catalog>.bakehouse_silver.suppliers_clean
+Derive every runtime output and expected rule from the exact authoring manifests that passed before deployment.
+Then verify object types, nonempty outputs, and numeric expectation counters from the exact update.
+
+```bash
+mapfile -t output_fqns < <(
+  jq -r '.[].fqn' <<<"$OUTPUT_MANIFEST_JSON" | LC_ALL=C sort
+)
+mapfile -t expectation_view_names < <(
+  jq -r '.[].materialized_view' <<<"$EXPECTATION_MANIFEST_JSON" \
+    | LC_ALL=C sort -u
+)
+expectation_silver_fqns=()
+for expectation_view_name in "${expectation_view_names[@]}"
 do
-  (databricks tables get "$table" --profile <workspace-profile> -o json \
-    | jq -er 'select(.table_type == "MATERIALIZED_VIEW") | .full_name') || exit 1
+  expectation_silver_fqns+=("$(
+    jq -er --arg name "$expectation_view_name" '
+      [.[] | select(.name == $name)]
+      | select(length == 1)
+      | .[0].fqn
+    ' <<<"$OUTPUT_MANIFEST_JSON"
+  )")
 done
-```
-
-Expected: the run state is `COMPLETED`, every response has `table_type` equal to `MATERIALIZED_VIEW`, and all eight exact materialized view names print.
-Any other object type fails the check.
-
-Use one query to prove every silver materialized view has rows:
-
-```bash
-statement=$(cat <<'SQL'
-SELECT 'transactions_clean' AS table_name, count(*) AS row_count
-FROM <catalog>.bakehouse_silver.transactions_clean
-UNION ALL
-SELECT 'customers_clean', count(*)
-FROM <catalog>.bakehouse_silver.customers_clean
-UNION ALL
-SELECT 'franchises_clean', count(*)
-FROM <catalog>.bakehouse_silver.franchises_clean
-UNION ALL
-SELECT 'suppliers_clean', count(*)
-FROM <catalog>.bakehouse_silver.suppliers_clean
-SQL
+mapfile -t quality_rule_names < <(
+  jq -r '.[].name' <<<"$EXPECTATION_MANIFEST_JSON" | LC_ALL=C sort
 )
+test "${#output_fqns[@]}" -eq "$(jq 'length' <<<"$OUTPUT_MANIFEST_JSON")"
+test "${#quality_rule_names[@]}" -eq "$(jq 'length' <<<"$EXPECTATION_MANIFEST_JSON")"
+materialized_view_count=0
+nonempty_output_count=0
+for output_fqn in "${output_fqns[@]}"
+do
+  table=$(
+    databricks tables get "$output_fqn" \
+      --profile "$DATABRICKS_CONFIG_PROFILE" -o json
+  )
+  jq -e '.table_type == "MATERIALIZED_VIEW"' >/dev/null <<<"$table"
+  materialized_view_count=$((materialized_view_count + 1))
+  statement=$(printf 'SELECT count(*) FROM %s' "$output_fqn")
+  run_sql "$statement" \
+    | jq -e '
+        .result.data_array
+        | select(length == 1)
+        | .[0][0]
+        | tonumber
+        | select(. > 0)' >/dev/null
+  nonempty_output_count=$((nonempty_output_count + 1))
+done
 
-run_sql "$statement" \
-  | jq -e '
-      [.result.data_array[] | {table: .[0], rows: (.[1] | tonumber)}]
-      | select(length == 4 and all(.[]; .rows > 0))'
-```
-
-Expected: four rows with `rows` greater than zero.
-
-Prove no invalid transaction rows survived:
-
-```bash
-statement=$(cat <<'SQL'
-SELECT
-  count_if(customerID IS NULL) AS null_customer_ids,
-  count_if(quantity IS NULL OR quantity <= 0) AS invalid_quantities,
-  count_if(franchiseID IS NULL) AS null_franchise_ids
-FROM <catalog>.bakehouse_silver.transactions_clean
-SQL
-)
-
-run_sql "$statement" \
-  | jq -e '
-      .result.data_array[0]
-      | map(tonumber)
-      | select(. == [0, 0, 0])'
-```
-
-Expected: `[0, 0, 0]`.
-
-Prove all expectations emitted numeric counters:
-
-```bash
-statement=$(cat <<SQL
+expectations_file=$(mktemp)
+: >"$expectations_file"
+expectation_schema=$(printf 'array\74struct\74name:string,passed_records:bigint,failed_records:bigint\76\76')
+for silver_fqn in "${expectation_silver_fqns[@]}"
+do
+  statement=$(cat <<SQL
 SELECT
   expectation.name,
   expectation.passed_records,
   expectation.failed_records
-FROM event_log(TABLE(<catalog>.bakehouse_silver.transactions_clean))
+FROM event_log(TABLE($silver_fqn))
 LATERAL VIEW explode(
   from_json(
     get_json_object(details, '$.flow_progress.data_quality.expectations'),
-    'array<struct<name:string,passed_records:bigint,failed_records:bigint>>'
+    '$expectation_schema'
   )
 ) exploded AS expectation
 WHERE event_type = 'flow_progress'
@@ -456,40 +545,65 @@ QUALIFY row_number() OVER (
 ORDER BY expectation.name
 SQL
 )
+  run_sql "$statement" \
+    | jq -ce '
+        .result.data_array[]
+        | {
+            name: .[0],
+            passed_records: (.[1] | tonumber),
+            failed_records: (.[2] | tonumber)
+          }' >>"$expectations_file"
+done
 
-run_sql "$statement" \
-  | jq -e '
-      [.result.data_array[] | {
-        name: .[0],
-        passed_records: (.[1] | tonumber),
-        failed_records: (.[2] | tonumber)
-      }]
-      | select(
-          map(.name) == ["valid_customer", "valid_franchise", "valid_quantity"]
-          and all(.[]; (.passed_records | type) == "number")
-          and all(.[]; (.failed_records | type) == "number")
-        )'
+expected_rules=$(mktemp)
+observed_rules=$(mktemp)
+printf '%s\n' "${quality_rule_names[@]}" | LC_ALL=C sort -u >"$expected_rules"
+jq -sr '
+  select(length > 0)
+  | select(all(.[];
+      (.passed_records | type) == "number"
+      and (.failed_records | type) == "number"))
+  | map(.name)
+  | unique
+  | sort
+  | .[]' "$expectations_file" >"$observed_rules"
+diff -u "$expected_rules" "$observed_rules"
+printf 'update=%s\nmaterialized_views=%s\nnonempty_outputs=%s\nexpectations=%s\n' \
+  "$state" \
+  "$materialized_view_count" \
+  "$nonempty_output_count" \
+  "$(wc -l <"$observed_rules" | tr -d ' ')"
 ```
 
-Expected: `valid_customer`, `valid_franchise`, and `valid_quantity`, each with numeric pass and fail counters.
-An empty result fails the check.
+Expected:
+
+```text
+update=COMPLETED
+materialized_views=<configured-output-count>
+nonempty_outputs=<configured-output-count>
+expectations=<configured-rule-count>
+```
 
 ## Where this fails
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Auth precheck is blocked or targets mismatch | Required auth value is missing or the profile reaches another workspace | Apply the auth remediation table and stop until all checks pass |
-| Source inspection returns permission denied | The deployment principal cannot read `samples.bakehouse` | Grant `USE CATALOG`, `USE SCHEMA`, and `SELECT` on the source |
-| Deploy reports a missing catalog or schema | The target catalog, `bakehouse_bronze`, or `bakehouse_silver` does not exist | Create the missing governed namespace before deploying |
-| Source inspection omits a required column | Bakehouse source column spelling drifted | Update expectations only after confirming the replacement column with the human |
-| Pipeline code contains legacy decorators | The source imports the legacy `dlt` module | Migrate to `from pyspark import pipelines as dp` |
-| A batch source fails validation as a stream | The source uses a streaming read | Use materialized views with `spark.read.table` |
-| Pipeline remains `INITIALIZING` for several minutes | Normal serverless cold start | Wait for the update and do not cancel it |
-| Polling reports an idle pipeline before work completes | The check polls top-level pipeline state | Poll the active update or use the blocking bundle run |
-| Expectation query returns no rows | Expectations did not attach or no flow progress event contains metrics | Inspect the update event log and fix the grouped decorator before continuing |
+| Authentication check fails before validation | The profile targets another account, workspace, or host | Correct the named values or reauthenticate the intended profile before continuing |
+| Source precheck reports missing required columns | The human source mapping does not match the live table | Correct the mapping or approve revised dataset logic before authoring |
+| Source precheck fails before inspection | A source FQN is not three nonempty components or a redundant field differs from the parsed FQN | Correct the derived source specification before continuing |
+| Quality rule precheck fails | A rule is incomplete, duplicated, or uses an action other than `warn`, `drop`, or `fail` | Correct the rule contract before authoring |
+| Authoring manifest validation fails | A materialized view, expectation, action, expression, file, name, or FQN is omitted, extra, or changed | Reconcile the complete manifests and focused Python files before deployment |
+| Source inspection or deployment returns permission denied | The deployment principal lacks source, schema, or warehouse privileges | Grant the minimum required read, write, and warehouse permissions |
+| Pipeline source imports `dlt` | The project uses the legacy pipeline module | Replace it with `from pyspark import pipelines as dp` |
+| A batch source is read as a stream | The dataset uses a streaming read for a batch input | Use a materialized view with `spark.read.table` |
+| Bundle validation reports a missing library | The resource path does not match `src/<pipeline_key>/` | Align `root_path`, the glob, and the source directory |
+| `tables get` reports another object type | The output was not published as a materialized view | Use `@dp.materialized_view` and redeploy |
+| The row-count check returns zero | The source is empty or transformation logic removed every row | Inspect the selected source and rule actions before accepting the run |
+| The expectation query returns no numeric counters | Rules did not attach or the event log has no matching flow progress for the update | Inspect the grouped decorator and query the exact update ID |
+| Verification passes an idle pipeline while work is active | Polling uses top-level pipeline state or a different update | Poll `get-update` with both the resolved pipeline ID and returned update ID |
 
 ## Next
 
 - **Do next:** [Metric Views](/docs/02-databricks-projects/metric-views/)
 - **Manual fallback:** [Starter Journey: build the first pipeline](https://databricks-solutions.github.io/starter-journey/docs/07-build-first-pipeline/)
-- **Reference:** [Lakeflow Spark Declarative Pipelines](https://docs.databricks.com/aws/en/ldp/)
+- **Back to section:** [Databricks Projects](/docs/02-databricks-projects/)

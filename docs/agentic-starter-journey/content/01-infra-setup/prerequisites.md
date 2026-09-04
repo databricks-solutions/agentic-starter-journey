@@ -16,13 +16,19 @@ Report what passed and what failed with the fix for each.
 
 ## Prerequisites
 
-None. This is the first page.
+None.
+This is the first page.
 Auth surface: `account` plus cloud CLI for the target cloud.
 This page is the bootstrap auth check.
 
 ## Skill
 
-None. This is a check page, not a skill invocation.
+None.
+This is a check page, not a skill invocation.
+Required installations:
+
+- [ai-platform-kit](https://github.com/databricks-solutions/ai-platform-kit)
+- [databricks-agent-skills](https://github.com/databricks/databricks-agent-skills#installation)
 
 ## Inputs
 
@@ -145,7 +151,8 @@ A mismatch with the human-named id is a hard failure; stop with the remediation 
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
 ```
 
-Expected: a number (zero or more). An auth error means the account profile is wrong.
+Expected: a number (zero or more).
+An auth error means the account profile is wrong.
 
 Do not run `databricks clusters list` against an account-host profile.
 That check belongs after a workspace profile exists.
@@ -159,7 +166,8 @@ find ~/.claude/skills ~/.cursor/skills .claude/skills .cursor/skills \
 
 Expected: each prints at least one path.
 A skill is installed when its `SKILL.md` exists.
-Frontmatter `name` may be `databricks-platform-provisioning` while the directory is `platform-provisioning`. Both forms are correct.
+Frontmatter `name` may be `databricks-platform-provisioning` while the directory is `platform-provisioning`.
+Both forms are correct.
 
 Example report format:
 
@@ -192,4 +200,3 @@ AWS profile  not set         ask the user which named profile to use
 ## Next
 
 - **Do next:** [Workspaces](/docs/01-infra-setup/workspaces/)
-- **Reference:** [ai-platform-kit](https://github.com/databricks-solutions/ai-platform-kit), [databricks-agent-skills installation](https://github.com/databricks/databricks-agent-skills#installation), [Databricks CLI authentication](https://docs.databricks.com/aws/en/dev-tools/cli/authentication)

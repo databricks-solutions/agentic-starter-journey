@@ -6,10 +6,8 @@ description: Deploy a governed metric view over project-selected sources and rec
 
 ## Mental Model
 
-A metric view stores governed dimensions and measures as YAML 1.1 over one cleaned source, with an optional verified many-to-one join.
-Use the no-join branch when every dimension and measure comes from one source.
-Use the joined branch only when the requested semantic definition needs a second source and its join quality checks pass.
-Deploy the DDL through an unscheduled bundle-managed SQL job because metric views are not a native bundle resource.
+A metric view stores governed dimensions and measures as YAML 1.1 over one source and an optional verified many-to-one join.
+Select the no-join or joined branch from the requested definition, then deploy its DDL through an unscheduled bundle SQL job.
 
 ## Goal
 
@@ -37,28 +35,16 @@ Invoke these verified skills in order:
 
 | Input | Source | How to obtain |
 |---|---|---|
-| Databricks account ID as `DATABRICKS_ACCOUNT_ID` | Human-provided | Use the account ID named for this deployment |
-| Workspace ID as `DATABRICKS_WORKSPACE_ID` | Human-provided | Use the workspace ID named for this deployment |
-| Workspace host as `DATABRICKS_HOST` | Human-provided | Use the named workspace URL |
-| Workspace CLI profile as `DATABRICKS_CONFIG_PROFILE` | Human-provided | Use the named profile for the target workspace |
+| Databricks target | Human-provided | Provide `DATABRICKS_ACCOUNT_ID`, `DATABRICKS_WORKSPACE_ID`, `DATABRICKS_HOST`, and the matching `DATABRICKS_CONFIG_PROFILE` |
 | Existing bundle project path as `PROJECT_PATH` | Human-provided | Use the project completed on the Spark Declarative Pipelines page |
-| Metric-view job key | Human-provided | Choose the bundle resource key and matching SQL filename |
-| Metric-view name | Human-provided | Choose the governed view name |
-| Metric-view target schema | Human-provided | Choose the schema created in the active target catalog |
+| Metric-view identity | Human-provided | Choose the job key and matching SQL filename, governed view name, and target schema |
 | Fact source FQN | Human-provided | Provide the cleaned three-part source name |
-| Dimension definitions | Human-provided | Provide each dimension name, display name, source expression, comment, and required source column |
-| Measure definitions | Human-provided | Provide each measure name, display name, aggregate expression, comment, and required source column |
-| Validation grain | Human-provided | Provide the complete dimension set used by both semantic and raw `GROUP BY ALL` queries |
-| Decimal tolerance | Human-provided | Provide the maximum accepted absolute difference for each decimal measure |
-| Exact-measure comparison policy | Human-provided | Identify measures that must use null-safe exact equality |
-| Join mode as `METRIC_JOIN_MODE` | Human-provided | Set exactly `none` or `joined` |
-| Joined relation | Human-provided | For `joined`, provide the source FQN, alias, `left` join type, fact key, and dimension key; not applicable for `none` |
-| Joined key policies | Human-provided | For `joined`, reject null keys on both sides and duplicate dimension keys; not applicable for `none` |
-| `UNMATCHED_ROW_POLICY` | Human-provided | Use `reject` by default for `joined`; set `accept` only when this row explicitly records acceptance of unmatched fact rows and that their joined dimensions become null; not applicable for `none` |
-| Required source columns | Agent-derived | Derive from all selected dimension, measure, and join expressions |
-| Source and key quality | Agent-derived | Run the column, null-key, uniqueness, and unmatched-row checks before writing DDL |
-| Resolved target | Agent-derived | Read catalog and warehouse ID from strict bundle validation, then combine the catalog, target schema, and metric-view name into the FQN |
-| Raw baseline SQL | Agent-derived | Translate the dimensions, measures, grain, and selected join branch into independent raw SQL |
+| Dimension definitions | Human-provided | Provide names, display names, expressions, comments, and required columns |
+| Measure definitions | Human-provided | Provide names, display names, aggregates, comments, and required columns |
+| Reconciliation policy | Human-provided | Provide dimension grain, decimal tolerances, and exact measures |
+| Join definition | Human-provided | Set `METRIC_JOIN_MODE` to `none` or `joined`; for `joined`, provide the source FQN, alias, `left` type, fact key, and dimension key |
+| Join policies | Human-provided | For `joined`, reject null keys and duplicate dimension keys; default `UNMATCHED_ROW_POLICY` to `reject`, or explicitly accept unmatched rows and their null-dimension consequence |
+| Derived verification | Agent-derived | Resolve catalog, warehouse, FQN, and required columns; check source and key quality; translate the selected definition into raw baseline SQL |
 
 For `join_mode=none`, every join-specific input is not applicable and the DDL must not contain a `joins:` block.
 For `join_mode=joined`, refuse `UNMATCHED_ROW_POLICY=accept` unless the human-provided input explicitly records both acceptance and the null-dimension consequence.
@@ -109,6 +95,7 @@ join_mode=$METRIC_JOIN_MODE
 case "$join_mode" in
   none)
     join_fqn=
+    join_name=
     fact_join_key=
     join_key=
     unmatched_row_policy=not_applicable
@@ -116,6 +103,7 @@ case "$join_mode" in
     ;;
   joined)
     join_fqn='<join_source_fqn>'
+    join_name='<join_name>'
     fact_join_key='<fact_join_key>'
     join_key='<join_key>'
     unmatched_row_policy=${UNMATCHED_ROW_POLICY:-reject}
@@ -397,9 +385,76 @@ Expected: only terminal `SUCCESS` passes.
 Require the exact object type, display names, YAML version, and branch-specific join shape.
 Then require positive semantic rows with no null dimensions or measures.
 
+Create `src/verify_metric_yaml.py` with this standard-library parser:
+
+```text
+import json, sys
+path, expected, mode, name, source, fact_key, join_key = sys.argv[1:]
+def scalar(text):
+    text = text.strip()
+    return text[1:-1].replace(text[0] * 2, text[0]) if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"" else text
+def pair(text):
+    quote = colon = None; cut, index = len(text), 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            if quote == '"' and char == "\\": index += 2; continue
+            if char == quote:
+                if index + 1 < len(text) and text[index + 1] == quote: index += 2; continue
+                quote = None
+        elif char in "'\"": quote = char
+        elif char == "#": cut = index; break
+        elif char == ":" and colon is None: colon = index
+        index += 1
+    return None if colon is None else (text[:colon].strip(), text[colon + 1:cut].strip())
+def parse(text):
+    versions, joins, active, block, item, item_indent = [], [], False, None, None, None
+    for raw in text.splitlines():
+        indent = len(raw) - len(raw.lstrip(" "))
+        if not raw.strip(): continue
+        if block is not None:
+            if indent > block: continue
+            block = None
+        body = raw[indent:]; parsed = pair(body)
+        if not parsed: continue
+        raw_key, value = parsed; key = scalar(raw_key)
+        if value and value[0] in "|>" and set(value[1:]) <= set("+-0123456789"): block = indent
+        if indent == 0:
+            active, item, item_indent = key == "joins", None, None
+            if key == "version": versions.append(scalar(value))
+            if active: joins.append([])
+        elif active and body.startswith("- "):
+            joins[-1].append({}); item, item_indent = joins[-1][-1], indent
+            raw_key, value = pair(body[2:].lstrip()) or ("", ""); key = scalar(raw_key)
+            if key: item[key] = (raw_key, scalar(value))
+        elif active and item is not None and indent == item_indent + 2:
+            if key in item: raise AssertionError(f"duplicate join key: {key}")
+            item[key] = (raw_key, scalar(value))
+    return versions, joins
+def valid(text, selected_mode):
+    versions, joins = parse(text)
+    if versions != ["1.1"]: return False
+    if selected_mode == "none": return not joins
+    if len(joins) != 1 or len(joins[0]) != 1: return False
+    entry = joins[0][0]; wanted = f"source.{fact_key} = {name}.{join_key}"
+    return entry.get("name", (None, None))[1] == name and entry.get("source", (None, None))[1] == source and entry.get("on", (None, None))[0] in {"'on'", '"on"'} and " ".join(entry.get("on", (None, ""))[1].split()) == wanted
+single = f"version: 1.1\njoins:\n  - name: {name}\n    source: {source}\n    'on': source.{fact_key} = {name}.{join_key}"
+double = single.replace("'on'", '"on"')
+wrong = single.replace(f"source.{fact_key} = {name}.{join_key}", "source.wrong = wrong.key") + f"\nnote: >\n  'on': source.{fact_key} = {name}.{join_key}"
+quoted = f'version: 1.1\nnote: "\'on\': source.{fact_key} = {name}.{join_key}"'
+block = f"version: 1.1\nnote: |\n  'on': source.{fact_key} = {name}.{join_key}"
+assert valid(single, "joined") and valid(double, "joined")
+assert all(not valid(case, "joined") for case in [single.replace("    'on':", "    # 'on':"), quoted, block, wrong])
+assert not valid("joins:\nversion: 1.1", "none")
+description = json.load(open(path))
+display = {column["name"]: column.get("metadata", {}).get("display_name") for column in description["columns"] if column.get("metadata", {}).get("display_name") is not None}
+assert description["type"] == "METRIC_VIEW" and display == json.loads(expected) and valid(description["view_text"], mode)
+```
+
+The parser ignores comments, quoted scalar content, and indented literal or folded block-scalar bodies.
+Its fixtures reject each false-positive shape before live metadata is evaluated.
+
 ```bash
-root_joins_pattern='(?m)^joins:[ \t]*$'
-join_on_pattern="(?m)^    ['\"]on['\"]: source[.]<fact_join_key> = <join_name>[.]<join_key>[ \t]*$"
 metric_cte=$(cat <<SQL
 metric AS (
   SELECT
@@ -418,35 +473,13 @@ SQL
 metadata=$(
   run_sql "DESCRIBE TABLE EXTENDED $metric_view_fqn AS JSON"
 )
-jq -e \
-  --argjson expected "$expected_display_names_json" \
-  --arg join_mode "$join_mode" \
-  --arg root_joins_pattern "$root_joins_pattern" \
-  --arg join_on_pattern "$join_on_pattern" '
-    .result.data_array
-    | select(length == 1)
-    | .[0][0]
-    | fromjson
-    | . as $description
-    | ([
-        $description.columns[]
-        | select(.metadata.display_name != null)
-        | {key: .name, value: .metadata.display_name}
-      ] | from_entries) as $actual
-    | select(
-        $description.type == "METRIC_VIEW"
-        and $actual == $expected
-        and ($description.view_text | test("(?m)^version: 1[.]1[ \t]*$"))
-        and (
-          if $join_mode == "joined"
-          then (
-            ($description.view_text | test($root_joins_pattern))
-            and ($description.view_text | test($join_on_pattern))
-          )
-          else ($description.view_text | test($root_joins_pattern) | not)
-          end
-        )
-      )' >/dev/null <<<"$metadata"
+description_file=$(mktemp)
+jq -er '.result.data_array | select(length == 1) | .[0][0] | fromjson' \
+  >"$description_file" <<<"$metadata"
+python3 src/verify_metric_yaml.py "$description_file" \
+  "$expected_display_names_json" "$join_mode" "$join_name" "$join_fqn" \
+  "$fact_join_key" "$join_key"
+rm -f "$description_file"
 
 semantic_statement=$(cat <<SQL
 WITH $metric_cte
@@ -583,25 +616,21 @@ printf '%s\n' \
 Expected: `metric_rows>0 metric_rows=raw_rows metric_null_rows=0 raw_null_rows=0 mismatch_rows=0`.
 
 Both raw SQL branches are independently executable.
-One result row proves positive semantic rows, equal row counts, zero null dimensions or measures on both sides, configured null-safe exact comparisons and decimal tolerances, and zero mismatches.
+The result proves positive equal row counts, no nulls, configured comparisons and tolerances, and zero mismatches.
 
 ## Where this fails
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Auth or active-target validation fails | A required target value is missing or the profile reaches another workspace | Reauthenticate the named profile against the named host and repeat the full precheck |
-| Warehouse rejects metric-view DDL or semantic queries | The selected warehouse is incompatible with YAML 1.1 metric views | Select a compatible warehouse, update the active bundle target, and repeat validation |
-| Metric-view creation rejects the YAML | The version, dimension, measure, or join definition is invalid | Align the selected DDL branch with the verified YAML 1.1 shape |
-| Metadata reports a drifted join expression | The persisted quoted `on` key or join expression changed | Restore the authored quoted key and the verified key mapping |
-| DDL contains unresolved `{{catalog}}` | The job parameter or bundle catalog variable is missing | Restore the `catalog` parameter and active-target variable |
-| Source-column assertion fails | A selected expression references a missing or renamed column | Correct the input definition or upstream source before deployment |
-| Join quality fails on null or duplicate keys | The dimension relationship is not many-to-one | Repair the source keys before using the joined branch |
-| Unmatched rows fail under the default policy | Fact rows have no dimension match | Repair the sources or obtain explicit human acceptance with its null-dimension consequence |
-| Semantic validity reports nulls | A dimension, measure, or accepted unmatched join produced null output | Correct the semantic definition or reject unmatched rows before downstream use |
-| Job reaches a terminal non-success state | The SQL task failed, was skipped, or encountered an internal error | Inspect the captured run and repair its task error before retrying |
-| Metadata assertion fails | The object type, display names, YAML version, or branch-specific join shape drifted | Compare the deployed description with the selected DDL and redeploy |
-| Reconciliation reports unequal rows or mismatches | The semantic and raw dimensions, measures, join, grain, exact comparison, or tolerance differ | Stop downstream work and align both definitions |
-| Reconciliation reports null rows | Either side emitted a null dimension or measure | Repair the source or definition because nulls fail closed even when keys compare null-safely |
+| Auth validation fails | The target is missing or mismatched | Reauthenticate the named profile and repeat the precheck |
+| Warehouse rejects DDL or queries | It is incompatible with YAML 1.1 metric views | Select a compatible warehouse and revalidate the target |
+| Creation or metadata validation fails | YAML version, display names, quoted `on` key, join entry, or expression drifted | Restore the selected YAML shape and redeploy |
+| DDL contains `{{catalog}}` | The catalog parameter is missing | Restore the parameter and target variable |
+| Source-column validation fails | An expression references a missing column | Correct the definition or source |
+| Join quality fails | Keys are null or duplicated | Repair keys before using the join |
+| Unmatched rows fail | A fact has no dimension match | Repair sources or explicitly accept the null-dimension consequence |
+| Job is not successful | Its SQL task failed or was skipped | Repair the captured task error |
+| Semantic or reconciliation validation fails | Results contain nulls, unequal rows, or measure mismatches | Align source, dimensions, measures, grain, comparisons, and tolerance |
 
 ## Next
 

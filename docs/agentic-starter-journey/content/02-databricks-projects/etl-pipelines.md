@@ -22,7 +22,7 @@ Add a project-defined batch pipeline to the existing bundle, run one new update,
 
 ## Skill
 
-Verified skills for this workflow:
+Invoke these verified skills in order:
 
 1. [`databricks-core`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-core)
 2. [`databricks-pipelines`](https://github.com/databricks/databricks-agent-skills/tree/main/plugins/databricks/claude/skills/databricks-pipelines)
@@ -49,10 +49,10 @@ Verified skills for this workflow:
 | `catalog` | Agent-derived | Read `.variables.catalog.value` from strict bundle validation |
 | `schema_prefix` | Agent-derived | Read `.variables.schema_prefix.value` from strict bundle validation |
 | `warehouse_id` | Agent-derived | Read `.variables.warehouse_id.value` from strict bundle validation |
-| Source name components | Human-provided | Provide the catalog, schema, and table that must exactly reconstruct each source FQN |
+| Source name components | Agent-derived | Parse the catalog, schema, and table from each validated three-part source FQN |
 | Bronze schema | Agent-derived | Use `${schema_prefix}_bronze` |
 | Silver schema | Agent-derived | Use `${schema_prefix}_silver` |
-| `SOURCE_SPECS_JSON` | Human-provided | Encode source FQNs, parsed name parts, and selected columns in the required JSON shape |
+| `SOURCE_SPECS_JSON` | Human-provided | Encode only source FQNs and selected columns in the required JSON shape |
 | `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
 | File layout | Agent-derived | Put each focused dataset file under `src/<pipeline_key>/` and the resource under `resources/` |
 
@@ -130,9 +130,6 @@ Define `SOURCE_SPECS_JSON` with this human-provided shape.
 [
   {
     "fqn": "<catalog>.<source_schema>.<source_table>",
-    "catalog": "<catalog>",
-    "schema": "<source_schema>",
-    "table": "<source_table>",
     "required_columns": ["<required_column_one>", "<required_column_two>"]
   }
 ]
@@ -145,24 +142,15 @@ jq -e '
   type == "array"
   and length > 0
   and all(.[];
-    (.fqn | type == "string" and length > 0)
-    and (.catalog | type == "string" and length > 0)
-    and (.schema | type == "string" and length > 0)
-    and (.table | type == "string" and length > 0)
-    and (.fqn == ([.catalog, .schema, .table] | join(".")))
+    (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$"))
     and (.required_columns | type == "array" and length > 0)
   )' >/dev/null <<<"$SOURCE_SPECS_JSON"
 source_count=$(jq 'length' <<<"$SOURCE_SPECS_JSON")
 for ((source_index = 0; source_index < source_count; source_index++))
 do
-  source_catalog=$(jq -er --argjson index "$source_index" \
-    '.[$index].catalog' <<<"$SOURCE_SPECS_JSON")
-  source_schema=$(jq -er --argjson index "$source_index" \
-    '.[$index].schema' <<<"$SOURCE_SPECS_JSON")
-  source_table=$(jq -er --argjson index "$source_index" \
-    '.[$index].table' <<<"$SOURCE_SPECS_JSON")
   source_fqn=$(jq -er --argjson index "$source_index" \
     '.[$index].fqn' <<<"$SOURCE_SPECS_JSON")
+  IFS=. read -r source_catalog source_schema source_table <<<"$source_fqn"
   required_columns=$(mktemp)
   observed_columns=$(mktemp)
   jq -r --argjson index "$source_index" \
@@ -452,7 +440,7 @@ expectations=<configured-rule-count>
 |---|---|---|
 | Authentication check fails before validation | The profile targets another account, workspace, or host | Correct the named values or reauthenticate the intended profile before continuing |
 | Source precheck reports missing required columns | The human source mapping does not match the live table | Correct the mapping or approve revised dataset logic before authoring |
-| Source precheck fails before inspection | A source FQN does not exactly equal its catalog, schema, and table components | Correct the inconsistent source contract before continuing |
+| Source precheck fails before inspection | A source FQN is not exactly three nonempty dot-separated components | Correct the source FQN before continuing |
 | Quality rule precheck fails | A rule is incomplete, duplicated, or uses an action other than `warn`, `drop`, or `fail` | Correct the rule contract before authoring |
 | Source inspection or deployment returns permission denied | The deployment principal lacks source, schema, or warehouse privileges | Grant the minimum required read, write, and warehouse permissions |
 | Pipeline source imports `dlt` | The project uses the legacy pipeline module | Replace it with `from pyspark import pipelines as dp` |

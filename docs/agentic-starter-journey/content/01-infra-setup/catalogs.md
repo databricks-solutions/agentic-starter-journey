@@ -65,6 +65,9 @@ Do not pick for the user.
 | Storage strategy | Human | Self-managed storage per catalog (recommended) or Databricks-managed metastore. The skill asks if unstated. |
 | Project name | Human | Drives schema names: `<project>_bronze`, `_silver`, `_gold` (page Verify expects this shape, not bare `bronze`) |
 | Owning group per project | Human | Must be account-level. Confirm against `databricks account groups list`. If create returns `WorkspaceGroup` / `meta.resourceType=WorkspaceGroup`, hard-fail and fix account SCIM. |
+| AWS account id and named profile | Human | Required for AWS. The named profile's live account id must match the expected 12-digit id. |
+| Azure expected subscription id and active CLI context | Human | Required for Azure. Select the expected subscription with `az account set --subscription <azure-subscription-id>`. |
+| GCP project id and named configuration | Human | Required for GCP. The named configuration's live project must match the expected id. |
 | Metastore ID | You derive | `databricks account metastores list`, filtered to the region of the target workspace |
 | Workspace IDs | You derive | Needed when `isolation_mode = ISOLATED`. OPEN catalogs are visible to every workspace on that metastore without a binding resource. |
 | Resource prefix / bucket name | You derive | From the chosen storage naming convention. Globally unique. |
@@ -78,7 +81,10 @@ The skill refuses a shared one: shared storage across environments means a dev j
 
 ### 0. Auth precheck
 
-Refuse if the human did not name all of these: Databricks account id, Databricks account CLI profile, workspace host, workspace id, workspace CLI profile, target cloud (`aws`, `azure`, or `gcp`), cloud account id, cloud CLI profile.
+Refuse if the human did not name the Databricks account and workspace targets, target cloud, and that cloud's expected identifier and auth context.
+AWS requires an account id and named profile.
+Azure requires an expected subscription id and active Azure CLI context.
+GCP requires a project id and named configuration.
 Do not invoke the skill until every named target is present.
 
 Run live checks:
@@ -88,11 +94,15 @@ databricks auth profiles
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
 databricks metastores current --profile <workspace-profile> -o json | jq '{workspace_id, metastore_id, name}'
 databricks current-user me --profile <workspace-profile> -o json | jq '{userName, workspace_id}'
-aws sts get-caller-identity --profile <aws-profile>     # AWS: Account must equal named cloud account id
-az account show                                             # Azure: tenant + subscription must match named ids
-gcloud auth list                                           # GCP: active account must match named project
+test "$(aws sts get-caller-identity --profile <aws-profile> --query Account --output text)" = "<aws-account-id>" \
+  || { echo "BLOCKED: AWS account id mismatch"; exit 1; }
+test "$(az account show --query id -o tsv)" = "<azure-subscription-id>" \
+  || { echo "BLOCKED: Azure subscription id mismatch"; exit 1; }
+test "$(gcloud config get-value project --configuration <gcp-configuration>)" = "<gcp-project-id>" \
+  || { echo "BLOCKED: GCP project id mismatch"; exit 1; }
 ```
 
+Run only the identity block for the target cloud.
 Confirm the workspace profile reaches the named host and that `workspace_id` matches the human-named workspace id.
 Compare live cloud identity and Databricks account id to the human-named values when obtainable.
 
@@ -106,8 +116,9 @@ Do not run Terraform.
 | `account workspaces list` fails | Confirm Account admin on the SP; regenerate OAuth secret (AWS) |
 | `metastores current` or `current-user me` fails | `databricks auth login --host <workspace-host> --profile <workspace-profile>` |
 | Workspace id mismatch | Fix workspace profile or human-named workspace id |
-| Cloud CLI not authenticated | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
-| Cloud account id mismatch | Pick the profile whose account id matches the human-named cloud account id |
+| AWS CLI not authenticated or account id mismatch | `aws sso login --profile <aws-profile>` and use the profile matching `<aws-account-id>` |
+| Azure CLI not authenticated or subscription id mismatch | `az login --tenant <tenant>` then `az account set --subscription <azure-subscription-id>` |
+| GCP CLI not authenticated or project id mismatch | `gcloud auth login --configuration <gcp-configuration>` then set `<gcp-project-id>` in that configuration |
 
 ### 1. Check the metastore before touching it
 
@@ -245,10 +256,10 @@ A failure here with the metadata all correct usually means the storage credentia
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **blocked: auth preflight failed** before Run | Missing named account id, profiles, workspace host/id, or cloud account id | Ask the human for every required target; rerun ### 0 |
+| **blocked: auth preflight failed** before Run | Missing Databricks target or cloud-specific expected id and auth context | Ask for the AWS profile, active Azure context, or gcloud configuration required by the selected cloud; rerun ### 0 |
 | Workspace profile fails `metastores current` | Expired workspace login or wrong host | `databricks auth login --host <workspace-host> --profile <workspace-profile>` |
 | Workspace id mismatch | Wrong workspace profile | Fix profile or human-named workspace id |
-| Cloud STS fails or account id mismatch | Expired or wrong cloud profile | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
+| Cloud identity check fails | Wrong AWS profile, active Azure subscription, or gcloud configuration | Reauthenticate the selected context and make its live identifier match the human-provided expected id |
 | Skill invoked despite red precheck | Agent skipped ### 0 | Always run ### 0 first; stop on any failure |
 | `PERMISSION_DENIED: User is not an owner of Metastore` | Caller cannot create catalogs | Grant CREATE_* on the metastore, or add them to the metastore admin group |
 | `No metastore assigned` | Workspace not attached to a metastore | Account admin assigns or creates the regional metastore, then retry |

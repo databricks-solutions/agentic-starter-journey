@@ -404,14 +404,16 @@ Require the exact object type, display names, YAML version, and branch-specific 
 Then require positive semantic rows with no null dimensions or measures.
 
 ```bash
+root_joins_pattern='(?m)^joins:[ \t]*$'
+join_on_pattern="(?m)^    'on': source[.]<fact_join_key> = <join_name>[.]<join_key>[ \t]*$"
 metadata=$(
   run_sql "DESCRIBE TABLE EXTENDED $metric_view_fqn AS JSON"
 )
 jq -e \
   --argjson expected "$expected_display_names_json" \
   --arg join_mode "$join_mode" \
-  --arg join_expression \
-    "'on': source.<fact_join_key> = <join_name>.<join_key>" '
+  --arg root_joins_pattern "$root_joins_pattern" \
+  --arg join_on_pattern "$join_on_pattern" '
     .result.data_array
     | select(length == 1)
     | .[0][0]
@@ -425,11 +427,14 @@ jq -e \
     | select(
         $description.type == "METRIC_VIEW"
         and $actual == $expected
-        and ($description.view_text | contains("version: 1.1"))
+        and ($description.view_text | test("(?m)^version: 1[.]1[ \t]*$"))
         and (
           if $join_mode == "joined"
-          then ($description.view_text | contains($join_expression))
-          else ($description.view_text | contains("\njoins:") | not)
+          then (
+            ($description.view_text | test($root_joins_pattern))
+            and ($description.view_text | test($join_on_pattern))
+          )
+          else ($description.view_text | test($root_joins_pattern) | not)
           end
         )
       )' >/dev/null <<<"$metadata"

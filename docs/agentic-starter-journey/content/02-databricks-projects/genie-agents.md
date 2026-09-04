@@ -11,7 +11,8 @@ It is not a native bundle resource.
 Author metric-view requests under `data_sources.metric_views`, then verify the persisted export under `data_sources.tables`.
 Treat the create parent as requested input and the `get-space` parent as its canonical persisted form.
 Persist the created space ID as ownership state and use that ID for every update.
-Validate one deterministic question through the Conversation API against an independently executed baseline.
+Validate one deterministic question through the Conversation API against an independent baseline.
+Generated `WITH` or nested queries fail closed, so use a simpler question or explicit `JOIN` shape.
 
 ## Goal
 
@@ -420,39 +421,21 @@ semicolons = [index for index, token in enumerate(tokens) if token[1] == ";"]
 assert not semicolons or semicolons == [len(tokens) - 1], "multiple or embedded statements are forbidden"
 if semicolons: tokens.pop()
 is_keyword = lambda token, word: token[0] == WORD and token[1].upper() == word
-assert is_keyword(tokens[0], "SELECT") or is_keyword(tokens[0], "WITH"), "first token must be SELECT or WITH"
-assert sum(is_keyword(token, "WITH") for token in tokens) == is_keyword(tokens[0], "WITH"), "nested WITH is forbidden"
+assert is_keyword(tokens[0], "SELECT"), "first token must be SELECT"
+assert not any(is_keyword(token, "WITH") for token in tokens), "WITH is forbidden"
 mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY"}
 assert not any(token[0] == WORD and token[1].upper() in mutations for token in tokens), "mutation or side-effecting SQL is forbidden"
 
-def closing(opening):
-    depth = tokens[opening][2]
-    return next(index for index in range(opening + 1, len(tokens)) if tokens[index][1] == ")" and tokens[index][2] == depth)
-
-def cte_aliases():
-    aliases, openings = set(), set()
-    if not is_keyword(tokens[0], "WITH"): return aliases, openings
-    position = 1 + (len(tokens) > 1 and is_keyword(tokens[1], "RECURSIVE"))
-    while True:
-        assert tokens[position][0] in {WORD, NAME}, "invalid CTE alias"
-        aliases.add(tokens[position][1].lower())
-        position += 1
-        if tokens[position][1] == "(": position = closing(position) + 1
-        assert is_keyword(tokens[position], "AS") and tokens[position + 1][1] == "(", "invalid CTE body"
-        openings.add(position + 1)
-        position = closing(position + 1) + 1
-        if tokens[position][1] != ",": break
-        position += 1
-    assert is_keyword(tokens[position], "SELECT"), "CTEs must end in SELECT"
-    return aliases, openings
-
-aliases, cte_openings = cte_aliases()
-
 for index, token in enumerate(tokens[:-1]):
-    if token[1] == "(" and is_keyword(tokens[index + 1], "SELECT"):
-        assert index in cte_openings, "nested subquery is forbidden"
+    assert token[1] != "(" or not (
+        is_keyword(tokens[index + 1], "SELECT")
+        or is_keyword(tokens[index + 1], "WITH")
+    ), "nested subquery is forbidden"
 
-terminators = {"WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY", "UNION", "EXCEPT", "INTERSECT"}
+terminators = {
+    "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY",
+    "UNION", "EXCEPT", "INTERSECT", "WINDOW", "DISTRIBUTE", "SORT", "CLUSTER",
+}
 relation_indexes = [index for index, token in enumerate(tokens) if is_keyword(token, "FROM") or is_keyword(token, "JOIN")]
 assert relation_indexes, "at least one FROM or JOIN target is required"
 for start in [index for index in relation_indexes if is_keyword(tokens[index], "FROM")]:
@@ -471,14 +454,10 @@ for relation in relation_indexes:
     while position + 2 < len(tokens) and tokens[position + 1][1] == "." and tokens[position + 2][0] in {WORD, NAME}:
         parts.append(tokens[position + 2][1])
         position += 2
-    if len(parts) == 3:
-        normalized = ".".join(parts)
-        assert normalized in allowed, {"target": normalized, "allowed": sorted(allowed)}
-        configured.add(normalized)
-    elif len(parts) == 1:
-        assert parts[0].lower() in aliases, {"target": parts[0], "cte_aliases": sorted(aliases)}
-    else:
-        raise AssertionError(f"target must be configured FQN or CTE alias: {'.'.join(parts)}")
+    assert len(parts) == 3, f"target must be configured FQN: {'.'.join(parts)}"
+    normalized = ".".join(parts)
+    assert normalized in allowed, {"target": normalized, "allowed": sorted(allowed)}
+    configured.add(normalized)
 assert configured, "query must read at least one configured FQN"
 outputs = {"generated": "read_only_query=true\ngrounded_sources=true", "baseline": "baseline_read_only=true"}
 assert mode in outputs, mode
@@ -488,7 +467,7 @@ python3 "$sql_gate" "$generated_sql" "$sources_file" generated
 python3 "$sql_gate" "$baseline_sql" "$sources_file" baseline
 ```
 
-The lexer tracks quote, comment, and parenthesis state, rejects relation commas at each query scope, and authorizes every `FROM` and `JOIN` target.
+The lexer tracks quote, comment, and parenthesis state, rejects top-level relation commas, and authorizes every `FROM` and `JOIN` FQN.
 
 ### Fetch and compare the exact result
 
@@ -547,11 +526,14 @@ Response prose is not verified.
 
 ## Where this fails
 
-- Missing approval, parent, pagination, or canonicalization: stop.
-- Rejected `metric_views` or `tables`, FQN drift, invalid ID, or private state: reconcile the target-owned contract.
-- Wrong warehouse, permission, Conversation, or attachment count: correct target or question.
-- Non-`SELECT` or non-`WITH` first token, mutation, multiple statements, comma join, nested subquery, or unconfigured source: reject the SQL.
-- Result mismatch: reconcile SQL and data.
+| Symptom | Cause | Fix |
+|---|---|---|
+| Approval, parent, pagination, or canonicalization fails | Mutation is not safe | Stop before mutation |
+| Source keys, FQNs, ID, or state drift | The target-owned contract differs | Reconcile ownership |
+| Warehouse, permission, Conversation, or attachment check fails | The target or question is wrong | Correct it |
+| Generated `WITH` query fails | The safety gate accepts only top-level `SELECT` | Ask a simpler deterministic question or require explicit configured joins |
+| SQL safety fails | The query mutates, nests, uses multiple statements, comma relations, or unconfigured sources | Reject it |
+| Result differs | SQL or data drifted | Reconcile both |
 
 ## Next
 

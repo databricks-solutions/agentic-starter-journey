@@ -278,12 +278,11 @@ collect_updates_through_baseline() {
     if test -n "$page_token"
     then
       response=$(databricks pipelines list-updates "$pipeline_id" \
-        --until-update-id "$baseline" --max-results 100 \
-        --page-token "$page_token" \
+        --max-results 100 --page-token "$page_token" \
         --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
     else
       response=$(databricks pipelines list-updates "$pipeline_id" \
-        --until-update-id "$baseline" --max-results 100 \
+        --max-results 100 \
         --profile "$DATABRICKS_CONFIG_PROFILE" -o json) || return
     fi
     jq -c '.updates[]' >>"$updates_file" <<<"$response"
@@ -393,6 +392,7 @@ assert_output_nonempty() {
 ```
 
 The baseline capture requires one prior update.
+The collection reads newest-first pages without `--until-update-id`, whose CLI semantics return the baseline and older updates.
 The paginated collection fails if it cannot reach that baseline within 20 pages of 100 updates.
 This assumes fewer than 2000 updates occur between immediate baseline capture and run completion.
 

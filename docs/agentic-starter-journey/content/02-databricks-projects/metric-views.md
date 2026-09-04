@@ -340,6 +340,7 @@ $$;
 Select exactly one DDL shape from `join_mode`.
 Both branches require YAML version 1.1 and display names.
 Only the joined branch contains `joins:` and the quoted `'on'` key.
+The service may serialize that quoted key with double quotes in persisted metadata.
 The no-join branch requires no join input.
 
 ### 3. Add one unscheduled SQL job
@@ -405,7 +406,7 @@ Then require positive semantic rows with no null dimensions or measures.
 
 ```bash
 root_joins_pattern='(?m)^joins:[ \t]*$'
-join_on_pattern="(?m)^    'on': source[.]<fact_join_key> = <join_name>[.]<join_key>[ \t]*$"
+join_on_pattern="(?m)^    ['\"]on['\"]: source[.]<fact_join_key> = <join_name>[.]<join_key>[ \t]*$"
 metadata=$(
   run_sql "DESCRIBE TABLE EXTENDED $metric_view_fqn AS JSON"
 )
@@ -604,7 +605,7 @@ One result row proves positive semantic rows, equal row counts, zero null dimens
 | Auth or active-target validation fails | A required target value is missing or the profile reaches another workspace | Reauthenticate the named profile against the named host and repeat the full precheck |
 | Warehouse rejects metric-view DDL or semantic queries | The selected warehouse is incompatible with YAML 1.1 metric views | Select a compatible warehouse, update the active bundle target, and repeat validation |
 | Metric-view creation rejects the YAML | The version, dimension, measure, or join definition is invalid | Align the selected DDL branch with the verified YAML 1.1 shape |
-| Metadata reports a drifted join expression | The quoted `'on'` key or join expression changed | Restore the quoted key and the verified key mapping |
+| Metadata reports a drifted join expression | The persisted quoted `on` key or join expression changed | Restore the authored quoted key and the verified key mapping |
 | DDL contains unresolved `{{catalog}}` | The job parameter or bundle catalog variable is missing | Restore the `catalog` parameter and active-target variable |
 | Source-column assertion fails | A selected expression references a missing or renamed column | Correct the input definition or upstream source before deployment |
 | Join quality fails on null or duplicate keys | The dimension relationship is not many-to-one | Repair the source keys before using the joined branch |

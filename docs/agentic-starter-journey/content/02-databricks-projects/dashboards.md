@@ -306,7 +306,7 @@ Replace only placeholders represented in Inputs:
 }
 ```
 
-Validate structure, supported widget versions, complete theme, and only the table tokens immediately following `FROM`:
+Validate structure, supported widget versions, complete theme, and exactly one bare table token after `FROM` in each dataset:
 
 ```bash
 jq -e '
@@ -332,26 +332,117 @@ jq -e '
   ]' "$dashboard_source" >/dev/null
 python3 - "$dashboard_source" <<'PY'
 import json
-import re
 import sys
 
+def tokens(sql):
+    result = []
+    index = 0
+    while index < len(sql):
+        if sql[index].isspace():
+            index += 1
+        elif sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = len(sql) if newline < 0 else newline + 1
+        elif sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            assert end >= 0, "unterminated comment"
+            index = end + 2
+        elif sql[index] == "'":
+            index += 1
+            while index < len(sql):
+                if sql[index] == "'" and index + 1 < len(sql) and sql[index + 1] == "'":
+                    index += 2
+                elif sql[index] == "'":
+                    index += 1
+                    break
+                else:
+                    index += 1
+            else:
+                raise AssertionError("unterminated string")
+        elif sql[index] == "`":
+            start = index
+            index += 1
+            while index < len(sql):
+                if sql[index] == "`" and index + 1 < len(sql) and sql[index + 1] == "`":
+                    index += 2
+                elif sql[index] == "`":
+                    index += 1
+                    break
+                else:
+                    index += 1
+            else:
+                raise AssertionError("unterminated identifier")
+            result.append(("identifier", sql[start:index]))
+        elif sql[index].isalpha() or sql[index] == "_":
+            start = index
+            index += 1
+            while index < len(sql) and (
+                sql[index].isalnum() or sql[index] in "_-"
+            ):
+                index += 1
+            result.append(("word", sql[start:index]))
+        else:
+            result.append(("symbol", sql[index]))
+            index += 1
+    return result
+
+terminators = {
+    "CROSS",
+    "EXCEPT",
+    "FULL",
+    "GROUP",
+    "HAVING",
+    "INNER",
+    "INTERSECT",
+    "JOIN",
+    "LEFT",
+    "LIMIT",
+    "ORDER",
+    "PIVOT",
+    "QUALIFY",
+    "RIGHT",
+    "SAMPLE",
+    "UNION",
+    "WHERE",
+}
 dashboard = json.load(open(sys.argv[1]))
 for dataset in dashboard["datasets"]:
     sql = "".join(dataset["queryLines"])
-    from_tokens = re.findall(
-        r"(?i)\bFROM\s+((?:`[^`]+`|[A-Za-z_][A-Za-z0-9_-]*)(?:\.(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_-]*))*)",
-        sql,
-    )
-    assert from_tokens, dataset["name"]
-    assert all("." not in token.replace("`", "") for token in from_tokens), {
+    parsed = tokens(sql)
+    from_indexes = [
+        index
+        for index, token in enumerate(parsed)
+        if token[0] == "word" and token[1].upper() == "FROM"
+    ]
+    assert len(from_indexes) == 1, {
         "dataset": dataset["name"],
-        "from_tokens": from_tokens,
+        "from_count": len(from_indexes),
+    }
+    from_index = from_indexes[0]
+    assert from_index + 1 < len(parsed), dataset["name"]
+    table_kind, table_token = parsed[from_index + 1]
+    assert table_kind in {"word", "identifier"}, {
+        "dataset": dataset["name"],
+        "table_token": table_token,
+    }
+    assert "." not in table_token.replace("``", ""), {
+        "dataset": dataset["name"],
+        "table_token": table_token,
+    }
+    suffix = parsed[from_index + 2 :]
+    assert (
+        not suffix
+        or suffix == [("symbol", ";")]
+        or (suffix[0][0] == "word" and suffix[0][1].upper() in terminators)
+    ), {
+        "dataset": dataset["name"],
+        "invalid_suffix": suffix[0],
     }
 print("bare_from_tokens=passed")
 PY
 ```
 
-Expected: the source parses, every query fragment has a separator, page and widget versions match the contract, the theme is complete, and every `FROM` table token is bare.
+Expected: the source parses, every query fragment has a separator, page and widget versions match the contract, the theme is complete, and each dataset has exactly one bare `FROM` table token with no qualified or invalid suffix.
 
 ### 2. Capture canonical source baselines
 
@@ -368,17 +459,20 @@ baseline_dir=$(mktemp -d)
 while IFS= read -r dataset
 do
   sql=$(dataset_sql "src/<dashboard_key>.lvdash.json" "$dataset")
+  baseline_file="$baseline_dir/$dataset.json"
   run_sql "$sql" \
-    | jq -S '{
+    | jq -eS '{
         columns: [.manifest.schema.columns[].name],
         rows: (.result.data_array | sort),
         row_count: .manifest.total_row_count
       } | select(.row_count > 0)' \
-    >"$baseline_dir/$dataset.json"
+    >"$baseline_file"
+  test -s "$baseline_file"
 done < <(jq -r '.datasets[].name' "src/<dashboard_key>.lvdash.json" | LC_ALL=C sort)
 ```
 
 Expected: every source dataset creates one nonempty canonical baseline with ordered column names, sorted exact rows, and a positive row count.
+An empty result makes `jq -eS` fail, and `test -s` independently rejects an empty baseline file.
 
 ### 3. Add the native dashboard resource
 
@@ -403,6 +497,8 @@ Capture a bundle-owned ID before deployment.
 An empty ID is allowed only on first creation:
 
 ```bash
+databricks bundle validate --strict --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE" >/dev/null
 pre_summary=$(databricks bundle summary --target dev \
   --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
 pre_id=$(jq -r --arg key "<dashboard_key>" \
@@ -419,7 +515,8 @@ then
 fi
 ```
 
-Expected: deployment returns a nonempty bundle-owned dashboard ID, and every update retains the pre-deploy ID.
+Expected: strict validation reruns after the source and resource are written, immediately before identity capture and deployment.
+Deployment returns a nonempty bundle-owned dashboard ID, and every update retains the pre-deploy ID.
 
 ### 5. Reject duplicates and publish
 
@@ -492,6 +589,7 @@ jq -e \
   >/dev/null <<<"$published"
 deployed_dashboard=$(mktemp)
 jq -er '.serialized_dashboard | fromjson' >"$deployed_dashboard" <<<"$draft"
+test -s "$deployed_dashboard"
 jq -e \
   --arg catalog "$catalog" \
   --arg schema "$dataset_schema" \
@@ -513,21 +611,25 @@ deployed_baseline_dir=$(mktemp -d)
 while IFS= read -r dataset
 do
   sql=$(dataset_sql "$deployed_dashboard" "$dataset")
+  deployed_baseline_file="$deployed_baseline_dir/$dataset.json"
   run_sql "$sql" \
-    | jq -S '{
+    | jq -eS '{
         columns: [.manifest.schema.columns[].name],
         rows: (.result.data_array | sort),
         row_count: .manifest.total_row_count
       } | select(.row_count > 0)' \
-    >"$deployed_baseline_dir/$dataset.json"
+    >"$deployed_baseline_file"
+  test -s "$deployed_baseline_file"
   diff -u \
     "$baseline_dir/$dataset.json" \
-    "$deployed_baseline_dir/$dataset.json"
+    "$deployed_baseline_file"
 done < <(jq -r '.datasets[].name' "$deployed_dashboard" | LC_ALL=C sort)
 source_dataset_names=$(mktemp)
 deployed_dataset_names=$(mktemp)
 jq -r '.datasets[].name' "$dashboard_source" | LC_ALL=C sort >"$source_dataset_names"
 jq -r '.datasets[].name' "$deployed_dashboard" | LC_ALL=C sort >"$deployed_dataset_names"
+test -s "$source_dataset_names"
+test -s "$deployed_dataset_names"
 diff -u "$source_dataset_names" "$deployed_dataset_names"
 dataset_count=$(wc -l <"$deployed_dataset_names" | tr -d ' ')
 printf 'identity_retained=true\nduplicates=0\npublished=true\nserialization_matches=true\ndatasets_match_baseline=%s\n' \
@@ -542,7 +644,7 @@ Expected: identity, duplicate, publish, and serialization checks report true, an
 |---|---|---|
 | Auth or active-target validation fails | A target input is missing or the profile reaches another workspace | Reauthenticate the named profile against the named target and repeat the precheck |
 | Catalog, schema, or warehouse resolution fails | The bundle variables or provided metric-view FQN are incomplete | Correct the active target or input before authoring the source |
-| Bare-name validation fails | A `FROM` table token contains a catalog or schema | Keep that table token bare and restore namespace injection on the resource |
+| Bare-name validation fails | A dataset has zero or multiple `FROM` clauses, a qualified name with or without spaces around dots, or an invalid table suffix | Keep exactly one bare table token after `FROM` and restore namespace injection on the resource |
 | Query-line validation fails | A fragment has no trailing newline or space | Restore the separator so adjacent SQL tokens cannot merge |
 | Counter or bar validation fails | The widget uses an unsupported type or version | Use counter version 2 and bar version 3 |
 | A widget returns the wrong field | Its selected fields and encodings do not match expected dataset columns | Restore the exact field bindings from Inputs |
@@ -558,5 +660,4 @@ Expected: identity, duplicate, publish, and serialization checks report true, an
 
 ## Next
 
-- **Do next:** [Genie Agents in Databricks Projects](/docs/02-databricks-projects/)
 - **Back to section:** [Databricks Projects](/docs/02-databricks-projects/)

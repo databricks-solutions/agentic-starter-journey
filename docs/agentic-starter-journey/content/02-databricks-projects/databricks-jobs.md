@@ -41,7 +41,7 @@ Invoke these verified skills in order:
 | `PROJECT_PATH` | Human-provided | Use the absolute local path to the completed project repository |
 | `BUNDLE_TARGET` | Human-provided | Set exactly to `dev` |
 | `<pipeline_key>` | Human-provided | Provide the existing bundle pipeline resource key |
-| `<pipeline_output_fqn>` | Human-provided | Provide a nonempty output table as a three-part name |
+| `<pipeline_output_fqn>` | Human-provided | Provide the exact nonempty three-part output table name embedded in the validation SQL |
 | `<single_job_key>` | Human-provided | Choose the single-task bundle job resource key |
 | `<single_job_display_name>` | Human-provided | Choose the single-task job display name |
 | `<dag_job_key>` | Human-provided | Choose the two-task DAG bundle job resource key |
@@ -77,6 +77,7 @@ resources:
 ```
 
 This native job has exactly one task and no schedule, trigger, or continuous configuration.
+Keep `full_refresh` false unless a human explicitly approves a full rebuild after reviewing its impact and cost.
 
 ### 2. Add the read-only validation query
 
@@ -121,7 +122,7 @@ This native job has exactly two tasks, one explicit dependency, and no schedule,
 ### 4. Validate the exact target, deploy, and resolve IDs
 
 Set every human-provided environment variable before running this block.
-Set `PIPELINE_OUTPUT_FQN` to the value supplied as `<pipeline_output_fqn>`.
+Set `PIPELINE_OUTPUT_FQN` to the exact FQN embedded in `src/<validation_sql_filename>`.
 
 ```bash
 set -euo pipefail
@@ -149,6 +150,18 @@ test -z "$output_extra" || {
 cd "$PROJECT_PATH"
 test "$(pwd -P)" = "$(cd "$PROJECT_PATH" && pwd -P)"
 test -f "$PROJECT_PATH/databricks.yml"
+validation_sql_file="$PROJECT_PATH/src/<validation_sql_filename>"
+test -f "$validation_sql_file"
+expected_validation_sql=$(mktemp)
+cat >"$expected_validation_sql" <<SQL
+SELECT assert_true(
+  count(*) > 0,
+  'The pipeline output must contain at least one row'
+)
+FROM $PIPELINE_OUTPUT_FQN;
+SQL
+diff -u "$expected_validation_sql" "$validation_sql_file"
+rm -f "$expected_validation_sql"
 databricks auth profiles -o json \
   | jq -e --arg profile "$DATABRICKS_CONFIG_PROFILE" '
       [.profiles[] | select(.name == $profile and .valid == true)]
@@ -394,7 +407,7 @@ run=$(poll_job)
 pipeline_task_key=refresh_pipeline
 updates_file=$(mktemp)
 collect_updates_through_baseline "$single_baseline"
-assert_exact_job_task_update "$single_baseline" "$run"
+single_update_id=$(assert_exact_job_task_update "$single_baseline" "$run")
 assert_output_nonempty
 single_task=$(jq -ce '
   [.tasks[] | select(.task_key == "refresh_pipeline")]
@@ -425,7 +438,7 @@ run=$(poll_job)
 pipeline_task_key=refresh_pipeline
 updates_file=$(mktemp)
 collect_updates_through_baseline "$dag_baseline"
-assert_exact_job_task_update "$dag_baseline" "$run"
+dag_update_id=$(assert_exact_job_task_update "$dag_baseline" "$run")
 assert_output_nonempty
 refresh_task=$(jq -ce '
   [.tasks[] | select(.task_key == "refresh_pipeline")]
@@ -469,7 +482,8 @@ The SQL assertion in the DAG and the independent row-count assertion after each 
 |---|---|---|
 | Bundle validation rejects the pipeline reference | `<pipeline_key>` does not identify a pipeline resource in the same bundle | Correct the resource key before deployment |
 | A deployed job contains a schedule, trigger, or continuous configuration | The resource has unrequested automatic execution settings | Remove those settings and redeploy |
-| A deployed pipeline task has `full_refresh: true` | The job would replace incremental processing with a full refresh | Set `full_refresh: false` and redeploy |
+| A deployed pipeline task has `full_refresh: true` | The job would replace incremental processing with a full rebuild | Stop until a human reviews the rebuild impact and cost and explicitly approves it, or restore `full_refresh: false` and redeploy |
+| Validation source check fails | `PIPELINE_OUTPUT_FQN` does not exactly match the FQN embedded in the validation SQL or the source file drifted | Correct the environment value or restore the exact read-only SQL before deployment |
 | The deployed graph assertion fails | Task keys, task count, run condition, warehouse, or dependency drifted | Restore the exact resource graph and redeploy |
 | `run-now` rejects the request | The command uses a resource key or an unsupported argument form instead of the resolved job ID | Pass the resolved numeric job ID with the shown syntax |
 | The poll rejects a terminated run | The job or one of its tasks has a result other than `SUCCESS` | Inspect the exact run output and repair the failing task |

@@ -424,7 +424,7 @@ is_keyword = lambda token, word: token[0] == WORD and token[1].upper() == word
 assert is_keyword(tokens[0], "SELECT"), "first token must be SELECT"
 assert sum(token[2] == 0 and is_keyword(token, "SELECT") for token in tokens) == 1, "exactly one top-level SELECT is required"
 assert not any(is_keyword(token, "WITH") for token in tokens), "WITH is forbidden"
-set_operators = {"UNION", "EXCEPT", "INTERSECT"}
+set_operators = {"UNION", "EXCEPT", "INTERSECT", "MINUS"}
 assert not any(token[2] == 0 and token[0] == WORD and token[1].upper() in set_operators for token in tokens), "set operations are forbidden"
 mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY"}
 assert not any(token[0] == WORD and token[1].upper() in mutations for token in tokens), "mutation or side-effecting SQL is forbidden"
@@ -434,7 +434,7 @@ assert not any(token[2] > 0 and token[0] == WORD and token[1].upper() in query_s
 
 terminators = {
     "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY",
-    "UNION", "EXCEPT", "INTERSECT", "WINDOW", "DISTRIBUTE", "SORT", "CLUSTER",
+    "UNION", "EXCEPT", "INTERSECT", "MINUS", "WINDOW", "DISTRIBUTE", "SORT", "CLUSTER",
 }
 relation_indexes = [index for index, token in enumerate(tokens) if is_keyword(token, "FROM") or is_keyword(token, "JOIN")]
 assert relation_indexes, "at least one FROM or JOIN target is required"

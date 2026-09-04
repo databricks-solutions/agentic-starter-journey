@@ -25,6 +25,10 @@ This page is the bootstrap auth check.
 
 None.
 This is a check page, not a skill invocation.
+Required installations:
+
+- [ai-platform-kit](https://github.com/databricks-solutions/ai-platform-kit)
+- [databricks-agent-skills](https://github.com/databricks/databricks-agent-skills#installation)
 
 ## Inputs
 
@@ -196,5 +200,3 @@ AWS profile  not set         ask the user which named profile to use
 ## Next
 
 - **Do next:** [Workspaces](/docs/01-infra-setup/workspaces/)
-- **Install:** [ai-platform-kit](https://github.com/databricks-solutions/ai-platform-kit)
-- **Install:** [databricks-agent-skills](https://github.com/databricks/databricks-agent-skills#installation)

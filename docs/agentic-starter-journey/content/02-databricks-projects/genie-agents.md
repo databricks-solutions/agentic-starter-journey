@@ -54,7 +54,42 @@ Invoke these verified skills in order:
 
 ## Run
 
-### 0. Design and obtain explicit approval
+### 0. Resolve the read-only target
+
+Start one persistent Bash session before preparing the approval package.
+This block reads authentication, current-user, and bundle state but mutates nothing.
+
+```text
+bash
+set -euo pipefail
+approval_session_pid=$$
+for required in DATABRICKS_ACCOUNT_ID DATABRICKS_WORKSPACE_ID DATABRICKS_HOST DATABRICKS_CONFIG_PROFILE PROJECT_PATH GENIE_TITLE GENIE_DESCRIPTION
+do
+  test -n "${!required:-}" || { printf '%s is required\n' "$required" >&2; exit 1; }
+done
+cd "$PROJECT_PATH"
+databricks() {
+  command databricks "$@" --profile "$DATABRICKS_CONFIG_PROFILE"
+}
+auth=$(databricks auth describe -o json)
+jq -e --arg a "$DATABRICKS_ACCOUNT_ID" --arg w "$DATABRICKS_WORKSPACE_ID" --arg h "$DATABRICKS_HOST" '
+  [.host // .details.host // .details.configuration.host.value,
+   .account_id // .details.configuration.account_id.value,
+   (.workspace_id // .details.configuration.workspace_id.value | tostring)] == [$h, $a, $w]
+' >/dev/null <<<"$auth"
+principal=$(databricks current-user me -o json \
+  | jq -er '.userName | select(type == "string" and length > 0 and (contains("/") | not))')
+requested_parent_path="/Workspace/Users/$principal/genie_agents"
+persisted_parent_path="/Users/$principal/genie_agents"
+bundle=$(databricks bundle validate --strict --target dev -o json)
+warehouse_id=$(jq -er '.variables.warehouse_id.value | select(type == "string" and length > 0)' <<<"$bundle")
+printf 'principal=%s\nrequested_parent=%s\npersisted_parent=%s\nwarehouse_id=%s\n' \
+  "$principal" "$requested_parent_path" "$persisted_parent_path" "$warehouse_id"
+```
+
+Expected: the exact target matches and the active principal, deterministic request path, canonical persisted path, and warehouse are printed before approval.
+
+### 1. Design and obtain explicit approval
 
 Create `src/genie_agent.json` as the complete proposed request:
 
@@ -65,6 +100,19 @@ Create `src/genie_agent.json` as the complete proposed request:
   "data_sources": {"metric_views": [{"identifier": "<catalog>.<schema>.<metric_view>", "column_configs": [{"column_name": "<categorical_dimension>", "enable_entity_matching": true, "enable_format_assistance": true, "synonyms": ["<approved_synonym>"]}]}]},
   "instructions": {"example_question_sqls": [{"id": "20000000000000000000000000000001", "question": ["<representative_question>"], "sql": ["<validated_read_only_sql>"]}], "text_instructions": [{"id": "30000000000000000000000000000001", "content": ["<approved_global_instruction>"]}]}
 }
+```
+
+Require the request source object to contain exactly `metric_views`.
+Reject an extra `tables` key before checksum or approval:
+
+```bash
+request_source_filter='(.data_sources | keys) == ["metric_views"]'
+jq -e "$request_source_filter" src/genie_agent.json >/dev/null
+if jq -en '{"data_sources":{"metric_views":[],"tables":[]}} | '"$request_source_filter" >/dev/null
+then
+  printf '%s\n' 'extra source-key fixture passed' >&2
+  exit 1
+fi
 ```
 
 Render the full file bytes, its entire parsed JSON, and its checksum for approval:
@@ -82,27 +130,16 @@ Do not modify the approved file after recording its hash.
 Do not create the parent folder, create a space, or update a space before this approval.
 Do not author request serialization with `tables`.
 
-### 1. Verify auth and resolve the strict target
+### 2. Continue after explicit approval
 
-Start one shell session only after explicit approval:
+Continue in the same Bash session.
+Every command before `workspace mkdirs` remains read-only or local validation:
 
 ```bash
-set -euo pipefail
-: "${DATABRICKS_ACCOUNT_ID:?}"
-: "${DATABRICKS_WORKSPACE_ID:?}"
-: "${DATABRICKS_HOST:?}"
-: "${DATABRICKS_CONFIG_PROFILE:?}"
-: "${PROJECT_PATH:?}"
-: "${GENIE_TITLE:?}"
-: "${GENIE_DESCRIPTION:?}"
+test "$approval_session_pid" = "$$"
 : "${GENIE_APPROVED_REQUEST_SHA256:?}"
 : "${GENIE_VALIDATION_QUESTION:?}"
 : "${GENIE_BASELINE_SQL:?}"
-
-cd "$PROJECT_PATH"
-databricks() {
-  command databricks "$@" --profile "$DATABRICKS_CONFIG_PROFILE"
-}
 genie_title=$GENIE_TITLE
 genie_description=$GENIE_DESCRIPTION
 direct_space_id=${GENIE_SPACE_ID:-}
@@ -117,28 +154,9 @@ then
   jq -en --arg id "$direct_space_id" \
     '$id | select(test("^[0-9a-f]{32}$"))' >/dev/null
 fi
-
-auth=$(databricks auth describe -o json)
-jq -e \
-  --arg account "$DATABRICKS_ACCOUNT_ID" \
-  --arg workspace "$DATABRICKS_WORKSPACE_ID" \
-  --arg host "$DATABRICKS_HOST" '
-    [
-      .host // .details.host // .details.configuration.host.value,
-      .account_id // .details.configuration.account_id.value,
-      (.workspace_id // .details.configuration.workspace_id.value | tostring)
-    ] == [$host, $account, $workspace]' >/dev/null <<<"$auth"
-principal=$(databricks current-user me -o json \
-  | jq -er '.userName | select(type == "string" and length > 0 and (contains("/") | not))')
-requested_parent_path="/Workspace/Users/$principal/genie_agents"
-persisted_parent_path="/Users/$principal/genie_agents"
 printf '%s  %s\n' "$GENIE_APPROVED_REQUEST_SHA256" src/genie_agent.json \
   | shasum -a 256 -c -
-bundle=$(databricks bundle validate --strict --target dev \
-  -o json)
-warehouse_id=$(jq -er '
-  .variables.warehouse_id.value
-  | select(type == "string" and length > 0)' <<<"$bundle")
+jq -e "$request_source_filter" src/genie_agent.json >/dev/null
 configured_sources=()
 while IFS= read -r configured_source
 do
@@ -147,13 +165,16 @@ done < <(jq -er '.data_sources.metric_views[].identifier' src/genie_agent.json)
 test "${#configured_sources[@]}" -ge 1
 printf '%s\n' "${configured_sources[@]}" >"$sources_file"
 expected_persisted_space=$(jq -ce '
-  .data_sources.tables = .data_sources.metric_views
-  | del(.data_sources.metric_views)
+  if (.data_sources | keys) == ["metric_views"]
+  then . as $request
+    | ($request | .data_sources = {"tables": $request.data_sources.metric_views})
+  else error("request data_sources must contain only metric_views")
+  end
 ' src/genie_agent.json)
 databricks workspace mkdirs "$requested_parent_path"
 ```
 
-### 2. Resolve ownership and fail closed
+### 3. Resolve ownership and fail closed
 
 ```bash
 assert_space() {
@@ -238,7 +259,7 @@ fi
 
 Title detects collisions, not ownership.
 
-### 3. Create or update by ID
+### 4. Create or update by ID
 
 ```bash
 if test "$deploy_action" = create
@@ -476,10 +497,16 @@ Create `src/verify_complete_statement.jq`:
 
 ```text
 .status.state == "SUCCEEDED" and (.result.data_array | type == "array")
-and (.manifest.truncated // false) == false and (.manifest.total_chunk_count // 1) == 1
-and ((.manifest.chunks // [null]) | length) == 1 and (.result.chunk_index // 0) == 0
-and (.result.next_chunk_internal_link // "") == "" and (.result.next_chunk_external_link // "") == ""
-and (.manifest.total_row_count | type == "number") and .manifest.total_row_count == (.result.data_array | length)
+and .manifest.truncated == false
+and (.manifest.total_chunk_count | type == "number") and .manifest.total_chunk_count == 1
+and (.manifest.chunks | type == "array") and (.manifest.chunks | length) == 1
+and (.manifest.chunks[0].chunk_index | type == "number") and .manifest.chunks[0].chunk_index == 0
+and (.manifest.chunks[0].row_count | type == "number") and .manifest.chunks[0].row_count == (.result.data_array | length)
+and (.result.chunk_index | type == "number") and .result.chunk_index == 0
+and (((.result | has("next_chunk_internal_link")) | not) or .result.next_chunk_internal_link == "")
+and (((.result | has("next_chunk_external_link")) | not) or .result.next_chunk_external_link == "")
+and (.manifest.total_row_count | type == "number")
+and .manifest.total_row_count == (.result.data_array | length)
 ```
 
 ```bash
@@ -502,14 +529,21 @@ jq -e '.statement_response' "$answer_file" >"$answer_statement_file"
 jq -e -f src/verify_complete_statement.jq "$answer_statement_file" >/dev/null
 
 complete_fixture=$(mktemp)
-jq -n '{status:{state:"SUCCEEDED"},manifest:{truncated:false,total_chunk_count:1,total_row_count:1},result:{chunk_index:0,data_array:[["1"]]}}' >"$complete_fixture"
+jq -n '{status:{state:"SUCCEEDED"},manifest:{truncated:false,total_chunk_count:1,total_row_count:1,chunks:[{chunk_index:0,row_count:1}]},result:{chunk_index:0,data_array:[["1"]]}}' >"$complete_fixture"
 jq -e -f src/verify_complete_statement.jq "$complete_fixture" >/dev/null
 for incomplete_fixture in \
-  '.manifest.truncated = true' \
-  '.manifest.total_chunk_count = 2' \
-  '.manifest.chunks = [{}, {}]' \
-  '.result.next_chunk_internal_link = "/next"' \
+  'del(.manifest.truncated)' \
+  'del(.manifest.total_chunk_count)' \
+  'del(.manifest.chunks)' \
+  'del(.manifest.chunks[0].chunk_index)' \
+  'del(.manifest.chunks[0].row_count)' \
+  'del(.result.chunk_index)' \
+  'del(.manifest.total_row_count)' \
+  '.manifest.chunks[0].row_count = 2' \
   '.manifest.total_row_count = 2' \
+  '.manifest.total_chunk_count = 2' \
+  '.manifest.chunks += [{chunk_index:1,row_count:0}]' \
+  '.result.next_chunk_internal_link = "/next"' \
   '.status.state = "RUNNING"'
 do
   if jq "$incomplete_fixture" "$complete_fixture" \
@@ -540,7 +574,7 @@ query_result_matches_baseline=true
 ```
 
 Response prose is not verified.
-Truncated, declared multi-chunk, extra chunk-manifest, next-link, row-count, and noncompleted fixtures must all fail before exact comparison.
+Every required completeness-field deletion, row-count mismatch, declared or manifest multi-chunk result, next-link, and noncompleted fixture must fail before exact comparison.
 
 ## Where this fails
 

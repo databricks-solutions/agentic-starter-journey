@@ -187,8 +187,8 @@ databricks api post /api/2.0/sql/statements --profile <workspace-profile> --json
 ```
 
 Expected: failure mentioning a read-only external location (for example `User cannot write to a read-only external location <name>`).
-Do not use catalog-scoped `CREATE TABLE` with `LOCATION` as the first write probe.
-It can fail on catalog privileges before testing the location.
+Do not use catalog-scoped `CREATE TABLE ...
+LOCATION` as the first write probe; it can fail on catalog privileges before testing the location.
 Do not leave probe objects behind on a successful write (that would mean the location was not read-only).
 
 ## Where this fails

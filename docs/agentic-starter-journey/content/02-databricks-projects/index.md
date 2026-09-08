@@ -18,7 +18,7 @@ Create the project repo, add ingestion when the source requires it, build the Sp
 | Order | Page | Skill | Status |
 |---|---|---|---|
 | 1 | [Project repo](/docs/02-databricks-projects/project-repo/) | `databricks-dabs` | Done |
-| 2 | [Ingestion Pipelines](/docs/02-databricks-projects/ingestion-pipelines/) | `databricks-lakeflow-connect`, `databricks-zerobus-ingest` | Done |
+| 2 | [Ingestion Pipelines](/docs/02-databricks-projects/ingestion-pipelines/) | `databricks-lakeflow-connect`, `databricks-zerobus-ingest` | Work in progress |
 | 3 | [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/) | `databricks-pipelines` | Done |
 | 4 | [Metric Views](/docs/02-databricks-projects/metric-views/) | `databricks-metric-views` | Done |
 | 5 | [Dashboards](/docs/02-databricks-projects/dashboards/) | `databricks-core`, `databricks-aibi-dashboards`, `databricks-dabs` | Done |

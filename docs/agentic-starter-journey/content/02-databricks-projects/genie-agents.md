@@ -12,7 +12,9 @@ Author metric-view requests under `data_sources.metric_views`, then verify the p
 Treat the create parent as requested input and the `get-space` parent as its canonical persisted form.
 Persist the created space ID as ownership state and use that ID for every update.
 Validate one deterministic question through the Conversation API against an independent baseline.
-Generated `WITH`, nested, or set-operation queries fail closed, so use a simpler question or explicit `JOIN` shape.
+A deterministic question returns one small, stable result set that fits in a single response chunk, so its rows equal the baseline on every run.
+The safety gate accepts read-only queries, including CTEs, subqueries, and set operations, and grounds every base table to a configured source.
+It rejects mutations, multiple statements, implicit comma joins, and unconfigured sources.
 
 ## Goal
 
@@ -47,7 +49,7 @@ Invoke these verified skills in order:
 | Example questions | Human-provided | Exact approved examples |
 | Justified text instructions | Human-provided | Each approved instruction |
 | Example SQL | Human-provided | Validated read-only SQL |
-| `GENIE_VALIDATION_QUESTION`, `GENIE_SPACE_ID`, `GENIE_STATE_FILE` | Human-provided | One query; ID optional on first create and authoritative when set; optional target-owned state |
+| `GENIE_VALIDATION_QUESTION`, `GENIE_SPACE_ID`, `GENIE_STATE_FILE` | Human-provided | One deterministic question whose answer is a small, stable result set in a single response chunk; ID optional on first create and authoritative when set; optional target-owned state |
 | Warehouse, source metadata, stable IDs, `GENIE_BASELINE_SQL`, expected result | Agent-derived | Resolve and validate the complete design |
 | Requested and persisted parent paths | Agent-derived | Derive `/Workspace/Users/<current-user.userName>/genie_agents` for requests and `/Users/<current-user.userName>/genie_agents` for persisted metadata |
 | Observed persistence contract | Agent-derived | `request_source_key=metric_views`, `persisted_source_key=tables`, `create_id_field=space_id`, and `query_attachment_id_field=attachment_id` |
@@ -445,16 +447,15 @@ semicolons = [index for index, token in enumerate(tokens) if token[1] == ";"]
 assert not semicolons or semicolons == [len(tokens) - 1], "multiple or embedded statements are forbidden"
 if semicolons: tokens.pop()
 is_keyword = lambda token, word: token[0] == WORD and token[1].upper() == word
-assert is_keyword(tokens[0], "SELECT"), "first token must be SELECT"
-assert sum(token[2] == 0 and is_keyword(token, "SELECT") for token in tokens) == 1, "exactly one top-level SELECT is required"
-assert not any(is_keyword(token, "WITH") for token in tokens), "WITH is forbidden"
-set_operators = {"UNION", "EXCEPT", "INTERSECT", "MINUS"}
-assert not any(token[2] == 0 and token[0] == WORD and token[1].upper() in set_operators for token in tokens), "set operations are forbidden"
-mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY"}
+assert is_keyword(tokens[0], "SELECT") or is_keyword(tokens[0], "WITH"), "query must start with SELECT or WITH"
+mutations = {"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "GRANT", "REVOKE", "CALL", "COPY", "REFRESH", "USE", "SET", "RESET"}
 assert not any(token[0] == WORD and token[1].upper() in mutations for token in tokens), "mutation or side-effecting SQL is forbidden"
-query_starters = {"SELECT", "WITH", "TABLE", "VALUES", "FROM"}
-assert not any(token[2] > 0 and token[0] == WORD and token[1].upper() in query_starters for token in tokens), "nested query is forbidden"
-terminators = {"WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY", "UNION", "EXCEPT", "INTERSECT", "MINUS", "WINDOW", "DISTRIBUTE", "SORT", "CLUSTER"}
+cte_names = set()
+for cte_index in range(len(tokens) - 2):
+    head, joiner, opener = tokens[cte_index], tokens[cte_index + 1], tokens[cte_index + 2]
+    if head[0] in {WORD, NAME} and is_keyword(joiner, "AS") and opener[0] == SYMBOL and opener[1] == "(":
+        cte_names.add(head[1].lower())
+terminators = {"WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "QUALIFY", "UNION", "EXCEPT", "INTERSECT", "MINUS", "WINDOW", "DISTRIBUTE", "SORT", "CLUSTER", "ON", "USING"}
 relation_indexes = [index for index, token in enumerate(tokens) if is_keyword(token, "FROM") or is_keyword(token, "JOIN")]
 assert relation_indexes, "at least one FROM or JOIN target is required"
 for start in [index for index in relation_indexes if is_keyword(tokens[index], "FROM")]:
@@ -464,18 +465,34 @@ for start in [index for index in relation_indexes if is_keyword(tokens[index], "
         assert token[2] != scope or token[1] != ",", "comma-separated relations are forbidden"
 allowed = {line.strip().replace("`", "") for line in open(sources_file) if line.strip()}
 assert allowed
-configured = set()
-for relation in relation_indexes:
-    position, parts = relation + 1, []
-    assert tokens[position][0] in {WORD, NAME}, "invalid relation target"
-    parts.append(tokens[position][1])
+def read_parts(position):
+    parts = [tokens[position][1]]
     while position + 2 < len(tokens) and tokens[position + 1][1] == "." and tokens[position + 2][0] in {WORD, NAME}:
         parts.append(tokens[position + 2][1])
         position += 2
-    assert len(parts) == 3, f"target must be configured FQN: {'.'.join(parts)}"
-    normalized = ".".join(parts)
-    assert normalized in allowed, {"target": normalized, "allowed": sorted(allowed)}
-    configured.add(normalized)
+    return parts
+configured = set()
+for relation in relation_indexes:
+    position = relation + 1
+    assert position < len(tokens), "missing relation target"
+    target = tokens[position]
+    if target[0] == SYMBOL and target[1] == "(":
+        continue
+    if target[0] == WORD and target[1].upper() in {"LATERAL", "VALUES"}:
+        continue
+    if target[0] == WORD and target[1].upper() == "TABLE":
+        position += 1
+        assert position < len(tokens) and tokens[position][0] in {WORD, NAME}, "invalid TABLE target"
+    assert tokens[position][0] in {WORD, NAME}, "invalid relation target"
+    parts = read_parts(position)
+    if len(parts) == 1:
+        assert parts[0].lower() in cte_names, {"unqualified_relation": parts[0]}
+    elif len(parts) == 3:
+        normalized = ".".join(parts)
+        assert normalized in allowed, {"target": normalized, "allowed": sorted(allowed)}
+        configured.add(normalized)
+    else:
+        raise AssertionError({"target": ".".join(parts), "reason": "relation must be a configured FQN or CTE name"})
 assert configured, "query must read at least one configured FQN"
 outputs = {"generated": "read_only_query=true\ngrounded_sources=true", "baseline": "baseline_read_only=true"}
 assert mode in outputs, mode
@@ -489,7 +506,7 @@ python3 src/verify_genie_sql.py "$generated_sql" "$sources_file" generated
 python3 src/verify_genie_sql.py "$baseline_sql" "$sources_file" baseline
 ```
 
-The lexer tracks quote, comment, and parenthesis state, rejects top-level relation commas, and authorizes every `FROM` and `JOIN` FQN.
+The lexer tracks quote, comment, and parenthesis state, allows read-only CTEs, subqueries, and set operations, rejects mutations, multiple statements, and implicit comma joins, and grounds every base relation to a configured FQN or a CTE name defined in the same query.
 
 ### Fetch and compare the exact result
 
@@ -583,8 +600,9 @@ Every required completeness-field deletion, row-count mismatch, declared or mani
 | Approval, parent, pagination, or canonicalization fails | Mutation is not safe | Stop before mutation |
 | Source keys, FQNs, ID, or state drift | The target-owned contract differs | Reconcile ownership |
 | Warehouse, permission, Conversation, or attachment check fails | The target or question is wrong | Correct it |
-| Generated `WITH` query fails | The safety gate accepts only top-level `SELECT` | Ask a simpler deterministic question or require explicit configured joins |
-| SQL safety fails | The query mutates, nests, uses set operations, multiple statements, comma relations, or unconfigured sources | Reject it |
+| Generated query is rejected as unsafe | It mutates, runs multiple statements, uses an implicit comma join, or reads an unconfigured source | Keep the question read-only and grounded in configured sources, since CTEs, subqueries, and set operations are allowed |
+| Result is truncated or multi-chunk | The validation question returns too large a result | Choose a deterministic question whose result fits one response chunk |
+| SQL safety fails | The query mutates, runs multiple statements, uses implicit comma relations, or reads unconfigured sources | Reject it |
 | Result differs | SQL or data drifted | Reconcile both |
 
 ## Next

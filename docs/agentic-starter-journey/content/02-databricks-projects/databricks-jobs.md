@@ -107,7 +107,7 @@ Start one persistent Bash session, then run every remaining Run and Verify block
 This preserves strict options, variables, arrays, and functions and avoids reserved-name behavior from another shell.
 
 ```bash
-bash
+/bin/bash --noprofile --norc
 ```
 
 ### 1. Resolve authentication and the bundle target
@@ -217,7 +217,7 @@ Inspect every local path named in `spec` before authoring.
 Stop when a referenced notebook, Python file, SQL file, wheel, JAR, or dbt project is missing.
 Resolve bundle resource keys used by `pipeline_task` or `run_job_task` from the same bundle before deploy.
 
-Only after the contract passes, invoke `databricks-core`, then `databricks-jobs`, then `databricks-dabs`.
+Use the already-invoked `databricks-core`, `databricks-jobs`, and `databricks-dabs` skills to implement the validated contract.
 
 ### 3. Write the native job resource
 
@@ -276,8 +276,10 @@ Do not add extra tasks that the contract does not list.
 ### 4. Deploy and resolve the job ID
 
 ```bash
-databricks bundle validate --strict --target dev \
-  --profile "$DATABRICKS_CONFIG_PROFILE"
+bundle=$(databricks bundle validate --strict --target dev \
+  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+deployed_job_name=$(jq -er --arg key "$job_key" \
+  '.resources.jobs[$key].name' <<<"$bundle")
 databricks bundle deploy --target dev \
   --profile "$DATABRICKS_CONFIG_PROFILE" --auto-approve
 job_id=$(
@@ -299,8 +301,9 @@ job_settings=$(databricks jobs get "$job_id" \
   --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
 jq -en \
   --argjson contract "$JOB_CONTRACT_JSON" \
+  --arg deployed_job_name "$deployed_job_name" \
   --argjson settings "$job_settings" '
-  ($settings.settings.name == $contract.display_name)
+  ($settings.settings.name == $deployed_job_name)
   and (($settings.settings.tasks | map(.task_key) | sort)
     == ($contract.tasks | map(.task_key) | sort))
   and ($contract.tasks | length == ($settings.settings.tasks | length))
@@ -371,7 +374,11 @@ Missing tasks, extra tasks, drifted edges, parameters, or the wrong execution bl
 For each deployed pipeline task, fetch its referenced pipeline and verify the compute contract there.
 
 ```bash
-mapfile -t deployed_pipeline_ids < <(
+deployed_pipeline_ids=()
+while IFS= read -r deployed_pipeline_id
+do
+  test -z "$deployed_pipeline_id" || deployed_pipeline_ids+=("$deployed_pipeline_id")
+done < <(
   jq -r '.settings.tasks[] | .pipeline_task.pipeline_id // empty' <<<"$job_settings" \
     | LC_ALL=C sort -u
 )
@@ -488,7 +495,11 @@ run_acceptance_checks() {
       command)
         expected=$(jq -er --argjson index "$check_index" \
           '.acceptance_checks[$index].expected_substring' <<<"$JOB_CONTRACT_JSON")
-        mapfile -t argv < <(jq -r --argjson index "$check_index" \
+        argv=()
+        while IFS= read -r argument
+        do
+          argv+=("$argument")
+        done < <(jq -r --argjson index "$check_index" \
           '.acceptance_checks[$index].argv[]' <<<"$JOB_CONTRACT_JSON")
         output=$("${argv[@]}")
         grep -F -- "$expected" <<<"$output" >/dev/null

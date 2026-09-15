@@ -65,6 +65,7 @@ Invoke these verified skills in order:
 | `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
 | `OUTPUT_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, dataset name, object type, and complete deployed FQN |
 | `EXPECTATION_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, dataset name, rule name, SQL expression, and action used for authoring |
+| `CDC_RECONCILIATION_JSON` | Agent-derived | For each CDC target, provide three scalar SQL checks named `cdc_current_mismatches`, `cdc_history_mismatches`, and `cdc_delete_mismatches`; each must return zero |
 | File layout | Agent-derived | Put each focused dataset file under `src/<pipeline_key>/` and the resource under `resources/` |
 
 ## Run
@@ -73,7 +74,7 @@ Start one persistent Bash session, then run every remaining Run and Verify block
 This preserves strict options, variables, arrays, and functions and avoids reserved-name behavior from another shell.
 
 ```bash
-bash
+/bin/bash --noprofile --norc
 ```
 
 ### 1. Resolve authentication and the bundle target
@@ -94,6 +95,7 @@ persistent_bash_pid=$$
 : "${QUALITY_RULES_JSON:?}"
 : "${OUTPUT_MANIFEST_JSON:?}"
 : "${EXPECTATION_MANIFEST_JSON:?}"
+: "${CDC_RECONCILIATION_JSON:=[]}"
 cd "$PROJECT_PATH"
 auth=$(databricks auth describe --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
 jq -e \
@@ -383,6 +385,40 @@ jq -en \
 Expected: both manifests are nonempty and unique, and no quality rule is missing or added.
 Use the already-invoked `databricks-core`, `databricks-pipelines`, and `databricks-dabs` skills to implement the validated contracts.
 
+When `SOURCE_SPECS_JSON` contains CDC, define one reconciliation set per flow.
+Each statement must return one numeric cell and reconcile the deployed SCD table to the ordered source-event contract.
+The current check compares latest nondeleted keys and payloads, the history check compares payload versions plus adjacent `__START_AT` and `__END_AT` boundaries, and the delete check proves keys whose latest operation is delete have no current row.
+
+```json
+[
+  {"target": "<silver_schema>.customers_scd2", "name": "cdc_current_mismatches", "statement": "<scalar_current_state_reconciliation_sql>"},
+  {"target": "<silver_schema>.customers_scd2", "name": "cdc_history_mismatches", "statement": "<scalar_history_and_interval_reconciliation_sql>"},
+  {"target": "<silver_schema>.customers_scd2", "name": "cdc_delete_mismatches", "statement": "<scalar_deleted_key_reconciliation_sql>"}
+]
+```
+
+```bash
+jq -en \
+  --argjson sources "$SOURCE_SPECS_JSON" \
+  --argjson checks "$CDC_RECONCILIATION_JSON" '
+  ($sources | map(select(.kind == "cdc") | .target) | sort) as $targets
+  | if ($targets | length) == 0 then $checks == []
+  else
+    ($checks | length == (($targets | length) * 3))
+    and all($checks[];
+      (.target | type == "string" and IN($targets[]))
+      and (.name | IN("cdc_current_mismatches", "cdc_history_mismatches", "cdc_delete_mismatches"))
+      and (.statement | type == "string" and length > 0))
+    and all($targets[];
+      . as $target
+      | ([$checks[] | select(.target == $target) | .name] | sort)
+        == (["cdc_current_mismatches", "cdc_delete_mismatches", "cdc_history_mismatches"] | sort))
+  end
+' >/dev/null
+```
+
+Expected: a non-CDC project has no CDC checks, and every CDC flow contributes all three named checks.
+
 ### 3. Write focused dataset files
 
 Choose the dataset API before writing files.
@@ -457,7 +493,10 @@ from pyspark.sql.functions import expr, struct
 def customer_changes():
     return spark.readStream.table("<source_fqn>")
 
-dp.create_streaming_table(name="<silver_schema>.customers_scd2")
+dp.create_streaming_table(
+    name="<silver_schema>.customers_scd2",
+    expect_all={"<warn_rule_name>": "<warn_rule_sql>"},
+)
 
 dp.create_auto_cdc_flow(
     target="<silver_schema>.customers_scd2",
@@ -549,6 +588,13 @@ for path in sorted(root.rglob("*.py")):
         dataset_name = ast.literal_eval(values[0])
         fqn = f"{catalog}.{dataset_name}" if "." in dataset_name else f"{catalog}.{bronze_schema}.{dataset_name}"
         actual_outputs.append({"file": relative, "name": dataset_name, "type": "STREAMING_TABLE", "fqn": fqn})
+        for item in call.keywords:
+            if item.arg not in actions:
+                continue
+            action, rules = actions[item.arg], ast.literal_eval(item.value)
+            assert isinstance(rules, dict) and rules
+            for name, sql in rules.items():
+                actual_rules.append({"file": relative, "dataset": dataset_name, "name": name, "sql": sql, "action": action})
 
 file_specs = [item for item in source_specs if item["kind"] == "files"]
 cdc_specs = [item for item in source_specs if item["kind"] == "cdc"]
@@ -779,10 +825,16 @@ Derive every runtime output and expected rule from the exact authoring manifests
 Then verify object types, nonempty outputs, and numeric expectation counters from the exact update.
 
 ```bash
-mapfile -t output_fqns < <(
-  jq -r '.[].fqn' <<<"$OUTPUT_MANIFEST_JSON" | LC_ALL=C sort
-)
-mapfile -t expectation_dataset_names < <(
+output_fqns=()
+while IFS= read -r output_fqn
+do
+  output_fqns+=("$output_fqn")
+done < <(jq -r '.[].fqn' <<<"$OUTPUT_MANIFEST_JSON" | LC_ALL=C sort)
+expectation_dataset_names=()
+while IFS= read -r expectation_dataset_name
+do
+  expectation_dataset_names+=("$expectation_dataset_name")
+done < <(
   jq -r '.[].dataset' <<<"$EXPECTATION_MANIFEST_JSON" \
     | LC_ALL=C sort -u
 )
@@ -797,9 +849,11 @@ do
     ' <<<"$OUTPUT_MANIFEST_JSON"
   )")
 done
-mapfile -t quality_rule_names < <(
-  jq -r '.[].name' <<<"$EXPECTATION_MANIFEST_JSON" | LC_ALL=C sort
-)
+quality_rule_names=()
+while IFS= read -r quality_rule_name
+do
+  quality_rule_names+=("$quality_rule_name")
+done < <(jq -r '.[].name' <<<"$EXPECTATION_MANIFEST_JSON" | LC_ALL=C sort)
 test "${#output_fqns[@]}" -eq "$(jq 'length' <<<"$OUTPUT_MANIFEST_JSON")"
 test "${#quality_rule_names[@]}" -eq "$(jq 'length' <<<"$EXPECTATION_MANIFEST_JSON")"
 dataset_count=0
@@ -894,26 +948,124 @@ nonempty_outputs=<configured-output-count>
 expectations=<configured-rule-count>
 ```
 
-For file ingestion, record output counts, run one additional update without adding files, and require unchanged counts.
-Then add exactly one file and require only its valid rows to appear.
-Query `_rescued_data` and representative payloads so schema drift or malformed values cannot pass silently.
+For file ingestion, snapshot every declared output before and after an update with no new files.
+Exact equality proves idempotency.
 
-For Auto CDC, verify current state and history separately.
+```bash
+snapshot_output_counts() {
+  local destination=$1 output_fqn count
+  : >"$destination"
+  for output_fqn in "${output_fqns[@]}"
+  do
+    count=$(run_sql "SELECT count(*) FROM $output_fqn" \
+      | jq -er '.result.data_array | select(length == 1) | .[0][0] | tonumber')
+    jq -nc --arg fqn "$output_fqn" --argjson count "$count" \
+      '{fqn:$fqn,count:$count}' >>"$destination"
+  done
+}
 
-```sql
-SELECT count(*) AS current_rows
-FROM <catalog>.<silver_schema>.<scd_table>
-WHERE __END_AT IS NULL;
+run_and_wait_update() {
+  local next_update_id next_update next_state
+  next_update_id=$(databricks bundle run <pipeline_key> --target dev \
+    --profile "$DATABRICKS_CONFIG_PROFILE" --no-wait -o json | jq -er '.update_id')
+  while :
+  do
+    next_update=$(databricks pipelines get-update "$pipeline_id" "$next_update_id" \
+      --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+    next_state=$(jq -er '.update.state' <<<"$next_update")
+    case "$next_state" in
+      COMPLETED) printf '%s\n' "$next_update_id"; return 0 ;;
+      CREATED|INITIALIZING|QUEUED|RESETTING|RUNNING|SETTING_UP_TABLES|WAITING_FOR_RESOURCES|STOPPING) sleep 15 ;;
+      *) jq '.update' >&2 <<<"$next_update"; return 1 ;;
+    esac
+  done
+}
 
-SELECT <key>, __START_AT, __END_AT
-FROM <catalog>.<silver_schema>.<scd_table>
-ORDER BY <key>, __START_AT;
+before_idle=$(mktemp)
+after_idle=$(mktemp)
+snapshot_output_counts "$before_idle"
+idle_update_id=$(run_and_wait_update)
+snapshot_output_counts "$after_idle"
+diff -u "$before_idle" "$after_idle"
+printf 'file_idle_update=COMPLETED counts_unchanged=true\n'
 ```
 
-Verify one insert, update, and delete against the source event contract.
+Expected: `file_idle_update=COMPLETED counts_unchanged=true`.
+
+Next, record the source-file count, add exactly one controlled file containing known valid rows and at least one malformed or drifted row, run another update, and snapshot again.
+Require exactly one additional source file, no output count decrease, at least one output increase, and a rescued row with provenance.
+
+```bash
+file_source_uri=$(jq -er '[.[] | select(.kind == "files")] | select(length == 1) | .[0].uri' <<<"$SOURCE_SPECS_JSON")
+source_files_before=$(databricks fs ls "dbfs:$file_source_uri" \
+  --profile "$DATABRICKS_CONFIG_PROFILE" -o json | jq 'length')
+before_incremental=$(mktemp)
+after_incremental=$(mktemp)
+snapshot_output_counts "$before_incremental"
+
+# Upload exactly one controlled arrival file here.
+
+source_files_after=$(databricks fs ls "dbfs:$file_source_uri" \
+  --profile "$DATABRICKS_CONFIG_PROFILE" -o json | jq 'length')
+test "$source_files_after" -eq $((source_files_before + 1))
+incremental_update_id=$(run_and_wait_update)
+snapshot_output_counts "$after_incremental"
+jq -en \
+  --slurpfile before "$before_incremental" \
+  --slurpfile after "$after_incremental" '
+  ($before | map({key:.fqn,value:.count}) | from_entries) as $b
+  | ($after | map({key:.fqn,value:.count}) | from_entries) as $a
+  | all($b | keys[]; $a[.] >= $b[.])
+    and any($b | keys[]; $a[.] > $b[.])
+' >/dev/null
+
+file_spec_count=$(jq '[.[] | select(.kind == "files")] | length' <<<"$SOURCE_SPECS_JSON")
+for ((file_spec_index = 0; file_spec_index < file_spec_count; file_spec_index++))
+do
+  file_dataset=$(jq -er --argjson index "$file_spec_index" \
+    '[.[] | select(.kind == "files")][$index].dataset' <<<"$SOURCE_SPECS_JSON")
+  rescued_column=$(jq -er --argjson index "$file_spec_index" \
+    '[.[] | select(.kind == "files")][$index].rescued_data_column' <<<"$SOURCE_SPECS_JSON")
+  provenance_column=$(jq -er --argjson index "$file_spec_index" \
+    '[.[] | select(.kind == "files")][$index].provenance_column' <<<"$SOURCE_SPECS_JSON")
+  file_output_fqn=$(jq -er --arg name "$file_dataset" \
+    '[.[] | select(.name == $name)] | select(length == 1) | .[0].fqn' <<<"$OUTPUT_MANIFEST_JSON")
+  run_sql "SELECT count(*) FROM $file_output_fqn WHERE $rescued_column IS NOT NULL AND $provenance_column IS NOT NULL" \
+    | jq -e '.result.data_array | select(length == 1) | .[0][0] | tonumber | select(. > 0)' >/dev/null
+done
+printf 'file_incremental_update=COMPLETED source_file_delta=1 rescued_provenance=passed\n'
+```
+
+Expected: `file_incremental_update=COMPLETED source_file_delta=1 rescued_provenance=passed`.
+Add a drift field only after the first successful update so it cannot become part of the initially inferred schema.
+
+For Auto CDC, execute every reconciliation check and require an exact zero from each scalar query.
+
+```bash
+cdc_check_count=$(jq 'length' <<<"$CDC_RECONCILIATION_JSON")
+for ((cdc_check_index = 0; cdc_check_index < cdc_check_count; cdc_check_index++))
+do
+  cdc_check_name=$(jq -er --argjson index "$cdc_check_index" '.[$index].name' <<<"$CDC_RECONCILIATION_JSON")
+  cdc_check_target=$(jq -er --argjson index "$cdc_check_index" '.[$index].target' <<<"$CDC_RECONCILIATION_JSON")
+  cdc_check_sql=$(jq -er --argjson index "$cdc_check_index" '.[$index].statement' <<<"$CDC_RECONCILIATION_JSON")
+  run_sql "$cdc_check_sql" \
+    | jq -e --arg name "$cdc_check_name" '
+        .result.data_array
+        | select(length == 1)
+        | .[0][0]
+        | tonumber
+        | select(. == 0)' >/dev/null
+  printf '%s=0 target=%s\n' "$cdc_check_name" "$cdc_check_target"
+done
+```
+
+Expected: each CDC flow prints `cdc_current_mismatches=0`, `cdc_history_mismatches=0`, and `cdc_delete_mismatches=0`.
+
 Use selective refresh with fully qualified dataset names for focused recovery.
 Do not use full refresh as routine recovery because it resets streaming state and can reprocess data.
 Require explicit human approval after explaining the replay and data-loss impact of a full refresh.
+After selective refresh, filter `OUTPUT_MANIFEST_JSON` to the selected dataset closure and `EXPECTATION_MANIFEST_JSON` to rules attached to that closure before reusing the generic exact-update checks.
+For untouched datasets, retain expectation evidence from their most recent processing update rather than requiring counters on the selective update.
 
 ## Where this fails
 

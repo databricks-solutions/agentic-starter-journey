@@ -61,7 +61,7 @@ Invoke these verified skills in order:
 | Source catalog, schema, and table components | Agent-derived | Parse all three fields from each validated human-provided source FQN |
 | Bronze schema | Agent-derived | Use `${schema_prefix}_bronze` |
 | Silver schema | Agent-derived | Use `${schema_prefix}_silver` |
-| `SOURCE_SPECS_JSON` | Agent-derived | Encode each source kind and its table identity or file-ingestion policy, then cross-check it before use |
+| `SOURCE_SPECS_JSON` | Agent-derived | Encode each source kind, focused file, dataset/flow identity, and its table, file-ingestion, or CDC policy; this is also the authoring contract |
 | `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
 | `OUTPUT_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, dataset name, object type, and complete deployed FQN |
 | `EXPECTATION_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, dataset name, rule name, SQL expression, and action used for authoring |
@@ -149,6 +149,7 @@ run_sql() {
 Populate `SOURCE_SPECS_JSON` with one contract per source.
 Table and CDC sources use a three-part FQN.
 File sources use a folder URI and an explicit ingestion policy.
+CDC contracts name every key and sequence column so the precheck and authoring validator can enforce the same policy.
 
 ```json
 [
@@ -162,11 +163,31 @@ File sources use a folder URI and an explicit ingestion policy.
   },
   {
     "kind": "files",
+    "file": "bronze/<bronze_dataset>.py",
+    "dataset": "<bronze_schema>.<bronze_dataset>",
     "uri": "/Volumes/<catalog>/<schema>/<volume>/<folder>",
     "format": "json",
     "schema_hints": "order_id BIGINT, amount DECIMAL(18,2)",
     "schema_evolution_mode": "rescue",
+    "rescued_data_column": "_rescued_data",
+    "provenance_column": "source_file",
     "required_columns": ["order_id", "amount"]
+  },
+  {
+    "kind": "cdc",
+    "file": "silver/customers_scd2.py",
+    "fqn": "<catalog>.<source_schema>.customer_events",
+    "catalog": "<catalog>",
+    "schema": "<source_schema>",
+    "table": "customer_events",
+    "required_columns": ["customer_id", "event_timestamp", "event_sequence", "operation"],
+    "target": "<silver_schema>.customers_scd2",
+    "source_view": "customer_changes",
+    "keys": ["customer_id"],
+    "sequence_by": ["event_timestamp", "event_sequence"],
+    "delete_predicate": "operation = 'DELETE'",
+    "except_columns": ["operation", "event_sequence"],
+    "scd_type": 2
   }
 ]
 ```
@@ -182,16 +203,33 @@ jq -e '
     and (.required_columns | type == "array" and length > 0)
     and (
       if .kind == "files" then
-        (.uri | type == "string" and startswith("/Volumes/"))
+        (.file | type == "string" and endswith(".py"))
+        and (.dataset | type == "string" and length > 0)
+        and (.uri | type == "string" and startswith("/Volumes/"))
         and (.format | IN("json", "csv", "parquet", "avro", "orc", "text", "xml", "binaryFile"))
         and (.schema_hints | type == "string" and length > 0)
         and (.schema_evolution_mode | IN("addNewColumns", "rescue", "failOnNewColumns", "none"))
+        and (.rescued_data_column | type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$"))
+        and (.provenance_column | type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$"))
       else
         (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$"))
         and (.catalog | type == "string" and length > 0)
         and (.schema | type == "string" and length > 0)
         and (.table | type == "string" and length > 0)
         and (.fqn == ([.catalog, .schema, .table] | join(".")))
+        and (
+          if .kind == "cdc" then
+            (.file | type == "string" and endswith(".py"))
+            and (.target | type == "string" and length > 0)
+            and (.source_view | type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$"))
+            and (.keys | type == "array" and length > 0 and length == (unique | length) and all(.[]; test("^[A-Za-z_][A-Za-z0-9_]*$")))
+            and (.sequence_by | type == "array" and length > 0 and length == (unique | length) and all(.[]; test("^[A-Za-z_][A-Za-z0-9_]*$")))
+            and (.delete_predicate | type == "string" and length > 0)
+            and (.except_columns | type == "array" and all(.[]; test("^[A-Za-z_][A-Za-z0-9_]*$")))
+            and (.scd_type | IN(1, 2))
+            and ((.keys + .sequence_by + .except_columns) - .required_columns | length == 0)
+          else true end
+        )
       end
     )
   )' >/dev/null <<<"$SOURCE_SPECS_JSON"
@@ -233,6 +271,34 @@ SQL
       "$source_fqn" "$missing" >&2
     exit 1
   }
+  if test "$source_kind" = cdc
+  then
+    key_null_predicate=$(jq -r --argjson index "$source_index" \
+      '[.[$index].keys[] + " IS NULL"] | join(" OR ")' <<<"$SOURCE_SPECS_JSON")
+    sequence_null_predicate=$(jq -r --argjson index "$source_index" \
+      '[.[$index].sequence_by[] + " IS NULL"] | join(" OR ")' <<<"$SOURCE_SPECS_JSON")
+    key_sequence_columns=$(jq -r --argjson index "$source_index" \
+      '[.[$index].keys[], .[$index].sequence_by[]] | join(", ")' <<<"$SOURCE_SPECS_JSON")
+    statement=$(cat <<SQL
+SELECT
+  (SELECT count(*) FROM $source_fqn WHERE $key_null_predicate) AS null_key_rows,
+  (SELECT count(*) FROM $source_fqn WHERE $sequence_null_predicate) AS null_sequence_rows,
+  (SELECT coalesce(sum(duplicate_count - 1), 0)
+   FROM (
+     SELECT count(*) AS duplicate_count
+     FROM $source_fqn
+     GROUP BY $key_sequence_columns
+     HAVING count(*) > 1
+   )) AS duplicate_key_sequence_rows
+SQL
+)
+    cdc_counts=$(run_sql "$statement" | jq -cer '.result.data_array[0]')
+    jq -e 'length == 3 and all(.[]; tonumber == 0)' >/dev/null <<<"$cdc_counts" || {
+      printf 'invalid CDC source %s [null_keys, null_sequences, duplicate_key_sequence]=%s\n' \
+        "$source_fqn" "$cdc_counts" >&2
+      exit 1
+    }
+  fi
 done
 printf 'source_precheck=passed sources=%s\n' "$source_count"
 ```
@@ -315,7 +381,7 @@ jq -en \
 ```
 
 Expected: both manifests are nonempty and unique, and no quality rule is missing or added.
-Only after both prechecks pass, invoke `databricks-core`, then `databricks-pipelines`, then `databricks-dabs`.
+Use the already-invoked `databricks-core`, `databricks-pipelines`, and `databricks-dabs` skills to implement the validated contracts.
 
 ### 3. Write focused dataset files
 
@@ -420,12 +486,41 @@ root = pathlib.Path(sys.argv[1])
 catalog, bronze_schema = sys.argv[2:4]
 expected_outputs = json.loads(sys.argv[4])
 expected_rules = json.loads(sys.argv[5])
+source_specs = json.loads(sys.argv[6])
 actions = {"expect_all": "warn", "expect_all_or_drop": "drop", "expect_all_or_fail": "fail"}
 actual_outputs, actual_rules = [], []
+trees, functions_by_file = {}, {}
+
+def dotted(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{dotted(node.value)}.{node.attr}"
+    return ""
+
+def keyword(call, name):
+    values = [item.value for item in call.keywords if item.arg == name]
+    assert len(values) == 1, f"expected one {name}= argument"
+    return values[0]
+
+def literal_keyword(call, name):
+    return ast.literal_eval(keyword(call, name))
+
+def call_attribute(call, name):
+    return isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == name
+
+def decorator_name(function, attribute):
+    matches = [item for item in function.decorator_list if call_attribute(item, attribute)]
+    if not matches:
+        return None
+    assert len(matches) == 1
+    return literal_keyword(matches[0], "name")
+
 for path in sorted(root.rglob("*.py")):
     relative = str(path.relative_to(root))
     tree = ast.parse(path.read_text(), filename=str(path))
     functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    trees[relative], functions_by_file[relative] = tree, functions
     for function in functions:
         calls = [item for item in function.decorator_list if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)]
         datasets = [(item, "MATERIALIZED_VIEW") for item in calls if item.func.attr == "materialized_view"]
@@ -454,6 +549,92 @@ for path in sorted(root.rglob("*.py")):
         dataset_name = ast.literal_eval(values[0])
         fqn = f"{catalog}.{dataset_name}" if "." in dataset_name else f"{catalog}.{bronze_schema}.{dataset_name}"
         actual_outputs.append({"file": relative, "name": dataset_name, "type": "STREAMING_TABLE", "fqn": fqn})
+
+file_specs = [item for item in source_specs if item["kind"] == "files"]
+cdc_specs = [item for item in source_specs if item["kind"] == "cdc"]
+all_cloud_files_calls, all_cdc_calls = [], []
+
+for relative, tree in trees.items():
+    all_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    all_cloud_files_calls += [
+        (relative, call) for call in all_calls
+        if call_attribute(call, "format")
+        and dotted(call.func.value) == "spark.readStream"
+        and len(call.args) == 1
+        and ast.literal_eval(call.args[0]) == "cloudFiles"
+    ]
+    all_cdc_calls += [(relative, call) for call in all_calls if call_attribute(call, "create_auto_cdc_flow")]
+
+assert len(all_cloud_files_calls) == len(file_specs), "every cloudFiles read needs exactly one file contract"
+assert len(all_cdc_calls) == len(cdc_specs), "every Auto CDC flow needs exactly one CDC contract"
+
+for spec in file_specs:
+    assert any(item["file"] == spec["file"] and item["name"] == spec["dataset"] and item["type"] == "STREAMING_TABLE" for item in expected_outputs)
+    functions = functions_by_file[spec["file"]]
+    candidates = [function for function in functions if decorator_name(function, "table") == spec["dataset"]]
+    assert len(candidates) == 1, f"file dataset not found: {spec}"
+    function = candidates[0]
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+    formats = [
+        call for call in calls
+        if call_attribute(call, "format") and dotted(call.func.value) == "spark.readStream"
+    ]
+    assert len(formats) == 1 and ast.literal_eval(formats[0].args[0]) == "cloudFiles"
+    options = {
+        ast.literal_eval(call.args[0]): ast.literal_eval(call.args[1])
+        for call in calls if call_attribute(call, "option") and len(call.args) == 2
+    }
+    assert "cloudFiles.schemaLocation" not in options, "pipelines manage Auto Loader schema state"
+    assert options["cloudFiles.format"] == spec["format"]
+    assert options["cloudFiles.schemaHints"] == spec["schema_hints"]
+    assert options["cloudFiles.schemaEvolutionMode"] == spec["schema_evolution_mode"]
+    if spec["rescued_data_column"] != "_rescued_data":
+        assert options["rescuedDataColumn"] == spec["rescued_data_column"]
+    loads = [call for call in calls if call_attribute(call, "load")]
+    assert len(loads) == 1 and ast.literal_eval(loads[0].args[0]) == spec["uri"]
+    provenance = [call for call in calls if call_attribute(call, "withColumn")]
+    assert any(
+        len(call.args) == 2
+        and ast.literal_eval(call.args[0]) == spec["provenance_column"]
+        and call_attribute(call.args[1], "col")
+        and len(call.args[1].args) == 1
+        and ast.literal_eval(call.args[1].args[0]) == "_metadata.file_path"
+        for call in provenance
+    ), f"missing file provenance: {spec}"
+
+def sequence_columns(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
+        assert node.func.attr == "struct" if isinstance(node.func, ast.Attribute) else node.func.id == "struct"
+        return [ast.literal_eval(item) for item in node.args]
+    raise AssertionError("sequence_by must be a column name or struct of column names")
+
+def expression_text(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    assert isinstance(node, ast.Call) and dotted(node.func) in ("expr", "F.expr") and len(node.args) == 1
+    return ast.literal_eval(node.args[0])
+
+for spec in cdc_specs:
+    assert any(item["file"] == spec["file"] and item["name"] == spec["target"] and item["type"] == "STREAMING_TABLE" for item in expected_outputs)
+    matches = [call for relative, call in all_cdc_calls if relative == spec["file"] and literal_keyword(call, "target") == spec["target"]]
+    assert len(matches) == 1, f"CDC flow not found: {spec}"
+    flow = matches[0]
+    assert literal_keyword(flow, "source") == spec["source_view"], f"CDC source mismatch: {spec}"
+    assert literal_keyword(flow, "keys") == spec["keys"], f"CDC keys mismatch: {spec}"
+    assert sequence_columns(keyword(flow, "sequence_by")) == spec["sequence_by"], f"CDC sequence mismatch: {spec}"
+    assert expression_text(keyword(flow, "apply_as_deletes")) == spec["delete_predicate"], f"CDC delete predicate mismatch: {spec}"
+    assert literal_keyword(flow, "except_column_list") == spec["except_columns"], f"CDC excluded columns mismatch: {spec}"
+    assert literal_keyword(flow, "stored_as_scd_type") == spec["scd_type"], f"CDC SCD type mismatch: {spec}"
+    functions = functions_by_file[spec["file"]]
+    views = [function for function in functions if decorator_name(function, "temporary_view") == spec["source_view"]]
+    assert len(views) == 1, f"CDC source view not found: {spec}"
+    table_reads = [
+        call for call in ast.walk(views[0])
+        if call_attribute(call, "table") and dotted(call.func.value) == "spark.readStream"
+    ]
+    assert len(table_reads) == 1 and ast.literal_eval(table_reads[0].args[0]) == spec["fqn"]
 
 def canonical(items):
     return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
@@ -484,11 +665,14 @@ python3 src/verify_pipeline_authoring.py \
   "$catalog" \
   "${schema_prefix}_bronze" \
   "$OUTPUT_MANIFEST_JSON" \
-  "$EXPECTATION_MANIFEST_JSON"
+  "$EXPECTATION_MANIFEST_JSON" \
+  "$SOURCE_SPECS_JSON"
 ```
 
 Expected: `authoring_manifests=passed omission_fixtures=passed`.
 Any omitted or extra dataset, object type, expectation rule, action, SQL expression, file, name, or FQN fails before deployment.
+For file sources, the parser also requires `spark.readStream`, `cloudFiles`, the contracted folder and options, no user-managed schema location, and `_metadata.file_path` provenance.
+For CDC sources, it requires the exact source view/FQN, target, keys, sequence columns, delete predicate, excluded columns, and SCD type.
 
 ### 4. Add the native pipeline resource
 

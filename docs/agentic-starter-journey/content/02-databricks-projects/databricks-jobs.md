@@ -260,6 +260,8 @@ run_job_task:
 ```
 
 Keep `full_refresh` false on any `pipeline_task` unless a human explicitly approves a full rebuild after reviewing its impact and cost.
+Pipeline-task compute belongs to the referenced pipeline, not to the Job task.
+When the project requires serverless, verify `spec.serverless == true` on that pipeline after deployment.
 For `manual`, omit `schedule`, `trigger`, and `continuous`.
 For other modes, add only the matching execution block from `databricks-jobs` triggers and schedules.
 
@@ -286,6 +288,8 @@ job_id=$(
 ```
 
 Expected: strict validation targets `dev` and the deployed job ID is nonempty.
+Strict validation checks the bundle shape but may not resolve a misspelled resource key inside `${resources.pipelines.<key>.id}` or `${resources.jobs.<key>.id}`.
+Treat deployment as the dependency-graph check and capture its exact `invalid dependency` error before correcting the key.
 
 ## Verify
 
@@ -364,6 +368,23 @@ printf 'deployed_graph=passed mode=%s tasks=%s\n' \
 
 Expected: `deployed_graph=passed` with the configured mode and task count.
 Missing tasks, extra tasks, drifted edges, parameters, or the wrong execution block fail here.
+For each deployed pipeline task, fetch its referenced pipeline and verify the compute contract there.
+
+```bash
+mapfile -t deployed_pipeline_ids < <(
+  jq -r '.settings.tasks[] | .pipeline_task.pipeline_id // empty' <<<"$job_settings" \
+    | LC_ALL=C sort -u
+)
+for deployed_pipeline_id in "${deployed_pipeline_ids[@]}"
+do
+  pipeline=$(databricks pipelines get "$deployed_pipeline_id" \
+    --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+  jq -e '.spec.serverless == true' >/dev/null <<<"$pipeline"
+done
+printf 'pipeline_tasks_serverless=%s\n' "${#deployed_pipeline_ids[@]}"
+```
+
+Expected: every pipeline referenced by this serverless project reports `spec.serverless=true`.
 
 Define run helpers after the graph check.
 
@@ -575,8 +596,9 @@ Job and task success without the acceptance checks is a failed verification.
 | Authentication check fails before validation | The profile targets another account, workspace, or host | Correct the named values or reauthenticate the intended profile before continuing |
 | Contract validation fails | A task type, run condition, mode, edge, parameter, or acceptance check is missing or invalid | Correct `JOB_CONTRACT_JSON` before authoring |
 | A referenced source file is missing | The contract names a notebook, SQL file, Python file, wheel, JAR, or dbt project that is not in the repo | Add the file or correct the path |
-| Bundle validation rejects a resource reference | A `pipeline_task` or `run_job_task` names a key that is not in the same bundle | Correct the resource key before deployment |
+| Deployment reports `invalid dependency` after strict validation passed | A `pipeline_task` or `run_job_task` names a key that is not in the same bundle | Correct the resource key, redeploy, and do not treat strict validation alone as graph resolution |
 | A deployed pipeline task has `full_refresh: true` | The job would replace incremental processing with a full rebuild | Stop until a human reviews the rebuild impact and cost and explicitly approves it, or restore `full_refresh: false` and redeploy |
+| A pipeline task has no serverless setting in the Job payload | Pipeline-task compute is configured on the referenced pipeline | Fetch that pipeline and verify its compute contract there |
 | The deployed graph assertion fails | Task keys, task count, types, run conditions, edges, parameters, or execution mode drifted | Restore the contract graph and redeploy |
 | `run-now` rejects the request | The command uses a resource key or an unsupported argument form instead of the resolved job ID | Pass the resolved numeric job ID with the shown syntax |
 | The poll rejects a terminated run | The job or one of its tasks has a result other than `SUCCESS` | Inspect the exact run output and repair the failing task |

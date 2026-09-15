@@ -1,22 +1,27 @@
 ---
-description: Build and verify a batch Spark Declarative Pipeline from project-defined sources, datasets, and quality rules.
+description: Build and verify batch, streaming, file-ingestion, and CDC Spark Declarative Pipelines from project-defined contracts.
 ---
 
 # Spark Declarative Pipelines
 
 ## Mental Model
 
-A batch Spark Declarative Pipeline copies selected sources into bronze materialized views, applies grouped quality rules in silver materialized views, and is deployed as a native bundle pipeline.
+A Spark Declarative Pipeline chooses each persisted dataset from source semantics.
+Use a materialized view for batch inputs and full-data recomputation.
+Use a streaming table for incremental tables and files.
+Use Auto Loader for incrementally discovered files and Auto CDC for ordered changes, deletes, and SCD history.
+Publish bronze, silver, and gold datasets to separate schemas when their quality and access contracts differ.
 
 ## Goal
 
-Add a project-defined batch pipeline to the existing bundle, run one new update, and verify its materialized views and expectation counters.
+Add a project-defined pipeline to the existing bundle, run one new update, and verify every dataset type, data postcondition, and expectation counter declared by the project.
 
 ## Prerequisites
 
 - Complete the [Project repo](/docs/02-databricks-projects/project-repo/) outcome.
-- Identify readable batch source tables and their required columns.
-- Provide writable bronze and silver schemas in the target catalog.
+- Classify every source as `batch_table`, `incremental_table`, `files`, or `cdc`.
+- Identify readable source tables or file folders and their required fields.
+- Provide writable bronze, silver, and optional gold schemas in the target catalog.
 - Configure workspace authentication for the intended account, workspace, and host.
 - Provide a SQL warehouse that the deployment principal can use for verification.
 
@@ -39,10 +44,14 @@ Invoke these verified skills in order:
 | `PROJECT_PATH` | Human-provided | Use the local path to the completed project repository |
 | `<pipeline_key>` | Human-provided | Choose the stable bundle resource key and source directory name |
 | `<pipeline_display_name>` | Human-provided | Choose the displayed pipeline name |
-| Source FQNs | Human-provided | List each readable batch source as a three-part name |
+| Source kind | Human-provided | Choose `batch_table`, `incremental_table`, `files`, or `cdc` for each source |
+| Source FQNs or folder URIs | Human-provided | List each readable table as a three-part name or each file source as a folder URI |
 | Selected columns | Human-provided | List the source columns required by each dataset |
-| `<bronze_dataset>` names | Human-provided | Choose one unique bronze materialized view name per source |
-| `<silver_dataset>` names | Human-provided | Choose one unique silver materialized view name per transformed dataset |
+| Output types | Human-provided | Choose `MATERIALIZED_VIEW` for batch recomputation or `STREAMING_TABLE` for incremental processing |
+| `<bronze_dataset>` names | Human-provided | Choose one unique bronze dataset per source and publish it explicitly in the bronze schema |
+| `<silver_dataset>` names | Human-provided | Choose one unique silver dataset per transformation and publish it explicitly in the silver schema |
+| File ingestion policy | Human-provided | For files, provide format, schema hints, evolution mode, rescued-data policy, and provenance columns |
+| CDC policy | Human-provided | For CDC, provide keys, operation mapping, deterministic sequence, delete behavior, and SCD type |
 | `<quality_rule_name>` values | Human-provided | Choose one unique name per quality rule |
 | `<quality_rule_sql>` values | Human-provided | Provide each SQL boolean expression |
 | Quality rule actions | Human-provided | Choose `warn`, `drop`, or `fail` for each rule |
@@ -52,10 +61,10 @@ Invoke these verified skills in order:
 | Source catalog, schema, and table components | Agent-derived | Parse all three fields from each validated human-provided source FQN |
 | Bronze schema | Agent-derived | Use `${schema_prefix}_bronze` |
 | Silver schema | Agent-derived | Use `${schema_prefix}_silver` |
-| `SOURCE_SPECS_JSON` | Agent-derived | Add redundant catalog, schema, and table fields parsed from the human-provided FQNs, then cross-check them before use |
+| `SOURCE_SPECS_JSON` | Agent-derived | Encode each source kind and its table identity or file-ingestion policy, then cross-check it before use |
 | `QUALITY_RULES_JSON` | Human-provided | Encode every rule name, SQL expression, and allowed action in the required JSON shape |
-| `OUTPUT_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, authored materialized-view name, and complete deployed FQN |
-| `EXPECTATION_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, materialized-view name, rule name, SQL expression, and action used for authoring |
+| `OUTPUT_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, dataset name, object type, and complete deployed FQN |
+| `EXPECTATION_MANIFEST_JSON` | Agent-derived | Encode every focused Python file, dataset name, rule name, SQL expression, and action used for authoring |
 | File layout | Agent-derived | Put each focused dataset file under `src/<pipeline_key>/` and the resource under `resources/` |
 
 ## Run
@@ -105,7 +114,7 @@ schema_prefix=$(jq -er '.variables.schema_prefix.value' <<<"$bundle")
 warehouse_id=$(jq -er '.variables.warehouse_id.value' <<<"$bundle")
 ```
 
-### 2. Inspect every batch source
+### 2. Inspect every source
 
 Use this Statement Execution helper for the source precheck and later verification.
 
@@ -137,37 +146,68 @@ run_sql() {
 }
 ```
 
-After the human provides each source FQN and its selected columns, populate `SOURCE_SPECS_JSON` with the parsed catalog, schema, and table fields.
+Populate `SOURCE_SPECS_JSON` with one contract per source.
+Table and CDC sources use a three-part FQN.
+File sources use a folder URI and an explicit ingestion policy.
 
 ```json
 [
   {
+    "kind": "batch_table",
     "fqn": "<catalog>.<source_schema>.<source_table>",
     "catalog": "<catalog>",
     "schema": "<source_schema>",
     "table": "<source_table>",
     "required_columns": ["<required_column_one>", "<required_column_two>"]
+  },
+  {
+    "kind": "files",
+    "uri": "/Volumes/<catalog>/<schema>/<volume>/<folder>",
+    "format": "json",
+    "schema_hints": "order_id BIGINT, amount DECIMAL(18,2)",
+    "schema_evolution_mode": "rescue",
+    "required_columns": ["order_id", "amount"]
   }
 ]
 ```
 
-Validate every redundant field against the human-provided FQN and stop before authoring when a required column is absent.
+Validate every source-kind contract and stop before authoring when a required table column or file policy is absent.
 
 ```bash
 jq -e '
   type == "array"
   and length > 0
   and all(.[];
-    (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$"))
-    and (.catalog | type == "string" and length > 0)
-    and (.schema | type == "string" and length > 0)
-    and (.table | type == "string" and length > 0)
-    and (.fqn == ([.catalog, .schema, .table] | join(".")))
+    (.kind | IN("batch_table", "incremental_table", "files", "cdc"))
     and (.required_columns | type == "array" and length > 0)
+    and (
+      if .kind == "files" then
+        (.uri | type == "string" and startswith("/Volumes/"))
+        and (.format | IN("json", "csv", "parquet", "avro", "orc", "text", "xml", "binaryFile"))
+        and (.schema_hints | type == "string" and length > 0)
+        and (.schema_evolution_mode | IN("addNewColumns", "rescue", "failOnNewColumns", "none"))
+      else
+        (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$"))
+        and (.catalog | type == "string" and length > 0)
+        and (.schema | type == "string" and length > 0)
+        and (.table | type == "string" and length > 0)
+        and (.fqn == ([.catalog, .schema, .table] | join(".")))
+      end
+    )
   )' >/dev/null <<<"$SOURCE_SPECS_JSON"
 source_count=$(jq 'length' <<<"$SOURCE_SPECS_JSON")
 for ((source_index = 0; source_index < source_count; source_index++))
 do
+  source_kind=$(jq -er --argjson index "$source_index" \
+    '.[$index].kind' <<<"$SOURCE_SPECS_JSON")
+  if test "$source_kind" = files
+  then
+    source_uri=$(jq -er --argjson index "$source_index" \
+      '.[$index].uri' <<<"$SOURCE_SPECS_JSON")
+    databricks fs ls "dbfs:$source_uri" \
+      --profile "$DATABRICKS_CONFIG_PROFILE" >/dev/null
+    continue
+  fi
   source_fqn=$(jq -er --argjson index "$source_index" \
     '.[$index].fqn' <<<"$SOURCE_SPECS_JSON")
   IFS=. read -r source_catalog source_schema source_table <<<"$source_fqn"
@@ -234,14 +274,14 @@ Derive complete authoring manifests before writing any focused Python file.
 
 ```json
 [
-  {"file": "bronze/<bronze_dataset>.py", "name": "<bronze_dataset>", "fqn": "<catalog>.<bronze_schema>.<bronze_dataset>"},
-  {"file": "silver/<silver_dataset>.py", "name": "<silver_schema>.<silver_dataset>", "fqn": "<catalog>.<silver_schema>.<silver_dataset>"}
+  {"file": "bronze/<bronze_dataset>.py", "name": "<bronze_schema>.<bronze_dataset>", "type": "<MATERIALIZED_VIEW_or_STREAMING_TABLE>", "fqn": "<catalog>.<bronze_schema>.<bronze_dataset>"},
+  {"file": "silver/<silver_dataset>.py", "name": "<silver_schema>.<silver_dataset>", "type": "<MATERIALIZED_VIEW_or_STREAMING_TABLE>", "fqn": "<catalog>.<silver_schema>.<silver_dataset>"}
 ]
 ```
 
 ```json
 [
-  {"file": "silver/<silver_dataset>.py", "materialized_view": "<silver_schema>.<silver_dataset>", "name": "<quality_rule_name>", "sql": "<quality_rule_sql>", "action": "drop"}
+  {"file": "silver/<silver_dataset>.py", "dataset": "<silver_schema>.<silver_dataset>", "name": "<quality_rule_name>", "sql": "<quality_rule_sql>", "action": "drop"}
 ]
 ```
 
@@ -256,6 +296,7 @@ jq -en \
     and all(.[];
       (.file | type == "string" and endswith(".py"))
       and (.name | type == "string" and length > 0)
+      and (.type | IN("MATERIALIZED_VIEW", "STREAMING_TABLE"))
       and (.fqn | type == "string" and test("^[^.]+\\.[^.]+\\.[^.]+$")))
     and ([.[].file] | length == (unique | length))
     and ([.[].name] | length == (unique | length))
@@ -263,11 +304,11 @@ jq -en \
   and ($expectations | length > 0
     and all(.[];
       (.file | type == "string" and endswith(".py"))
-      and (.materialized_view | type == "string" and length > 0)
+      and (.dataset | type == "string" and length > 0)
       and (.name | type == "string" and length > 0)
       and (.sql | type == "string" and length > 0)
       and (.action | IN("warn", "drop", "fail")))
-    and ([.[] | [.file, .materialized_view, .name]] | length == (unique | length)))
+    and ([.[] | [.file, .dataset, .name]] | length == (unique | length)))
   and ($quality | sort_by(.name))
     == ($expectations | map({name, sql, action}) | sort_by(.name))
 ' >/dev/null
@@ -278,12 +319,22 @@ Only after both prechecks pass, invoke `databricks-core`, then `databricks-pipel
 
 ### 3. Write focused dataset files
 
-Create one bronze file for each source under `src/<pipeline_key>/bronze/`.
+Choose the dataset API before writing files.
+
+| Source behavior | Dataset API | Read API |
+|---|---|---|
+| Batch table or full-data aggregation | `@dp.materialized_view` | `spark.read.table` |
+| Incremental Delta table | `@dp.table` | `spark.readStream.table` |
+| Incrementally discovered files | `@dp.table` with Auto Loader | `spark.readStream.format("cloudFiles")` |
+| Ordered changes, deletes, or SCD history | `dp.create_streaming_table` plus `dp.create_auto_cdc_flow` | A streaming temporary view |
+
+Create one focused file for each dataset under `src/<pipeline_key>/`.
+This batch example produces materialized views.
 
 ```python
 from pyspark import pipelines as dp
 
-@dp.materialized_view(name="<bronze_dataset>")
+@dp.materialized_view(name="<bronze_schema>.<bronze_dataset>")
 def bronze_dataset():
     return spark.read.table("<source_fqn>")
 ```
@@ -305,8 +356,56 @@ from pyspark import pipelines as dp
     "<fail_rule_name>": "<fail_rule_sql>",
 })
 def silver_dataset():
-    return spark.read.table("<bronze_dataset>")
+    return spark.read.table("<bronze_schema>.<bronze_dataset>")
 ```
+
+This file-ingestion example produces a bronze streaming table and retains malformed or drifted data for inspection.
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql import functions as F
+
+@dp.table(name="<bronze_schema>.<bronze_dataset>")
+def bronze_dataset():
+    return (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "<file_format>")
+        .option("cloudFiles.schemaHints", "<schema_hints>")
+        .option("cloudFiles.schemaEvolutionMode", "rescue")
+        .load("<folder_uri>")
+        .withColumn("source_file", F.col("_metadata.file_path"))
+    )
+```
+
+Read folders rather than individual arrival files.
+Keep `_rescued_data` in bronze and state whether silver retains, drops, or quarantines rescued rows.
+Verify idempotency by rerunning without new files and requiring unchanged counts.
+
+This CDC example creates an SCD Type 2 streaming target with deterministic sequencing.
+
+```python
+from pyspark import pipelines as dp
+from pyspark.sql.functions import expr, struct
+
+@dp.temporary_view(name="customer_changes")
+def customer_changes():
+    return spark.readStream.table("<source_fqn>")
+
+dp.create_streaming_table(name="<silver_schema>.customers_scd2")
+
+dp.create_auto_cdc_flow(
+    target="<silver_schema>.customers_scd2",
+    source="customer_changes",
+    keys=["customer_id"],
+    sequence_by=struct("event_timestamp", "event_sequence"),
+    apply_as_deletes=expr("operation = 'DELETE'"),
+    except_column_list=["operation", "event_sequence"],
+    stored_as_scd_type=2,
+)
+```
+
+Reject null keys, null sequences, and duplicate key-plus-sequence rows before deployment.
+For SCD Type 2, query current rows with `__END_AT IS NULL` and verify history with `__START_AT` and `__END_AT`.
 
 Map `warn` to `expect_all`, `drop` to `expect_all_or_drop`, and `fail` to `expect_all_or_fail`.
 Omit a decorator when that action group is empty.
@@ -329,24 +428,32 @@ for path in sorted(root.rglob("*.py")):
     functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
     for function in functions:
         calls = [item for item in function.decorator_list if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)]
-        views = [item for item in calls if item.func.attr == "materialized_view"]
+        datasets = [(item, "MATERIALIZED_VIEW") for item in calls if item.func.attr == "materialized_view"]
+        datasets += [(item, "STREAMING_TABLE") for item in calls if item.func.attr == "table"]
         expectations = [item for item in calls if item.func.attr in actions]
-        if not views:
-            assert not expectations, f"expectation without materialized view: {relative}:{function.name}"
+        if not datasets:
+            assert not expectations, f"expectation without dataset: {relative}:{function.name}"
             continue
-        assert len(views) == 1
-        values = [item.value for item in views[0].keywords if item.arg == "name"]
+        assert len(datasets) == 1
+        dataset, dataset_type = datasets[0]
+        values = [item.value for item in dataset.keywords if item.arg == "name"]
         assert len(values) == 1
-        view = ast.literal_eval(values[0])
-        assert isinstance(view, str) and view
-        fqn = f"{catalog}.{view}" if "." in view else f"{catalog}.{bronze_schema}.{view}"
-        actual_outputs.append({"file": relative, "name": view, "fqn": fqn})
+        dataset_name = ast.literal_eval(values[0])
+        assert isinstance(dataset_name, str) and dataset_name
+        fqn = f"{catalog}.{dataset_name}" if "." in dataset_name else f"{catalog}.{bronze_schema}.{dataset_name}"
+        actual_outputs.append({"file": relative, "name": dataset_name, "type": dataset_type, "fqn": fqn})
         for decorator in expectations:
             assert len(decorator.args) == 1 and not decorator.keywords
             action, rules = actions[decorator.func.attr], ast.literal_eval(decorator.args[0])
             assert isinstance(rules, dict) and rules
             for name, sql in rules.items():
-                actual_rules.append({"file": relative, "materialized_view": view, "name": name, "sql": sql, "action": action})
+                actual_rules.append({"file": relative, "dataset": dataset_name, "name": name, "sql": sql, "action": action})
+    for call in [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "create_streaming_table"]:
+        values = [item.value for item in call.keywords if item.arg == "name"]
+        assert len(values) == 1
+        dataset_name = ast.literal_eval(values[0])
+        fqn = f"{catalog}.{dataset_name}" if "." in dataset_name else f"{catalog}.{bronze_schema}.{dataset_name}"
+        actual_outputs.append({"file": relative, "name": dataset_name, "type": "STREAMING_TABLE", "fqn": fqn})
 
 def canonical(items):
     return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
@@ -354,10 +461,10 @@ def canonical(items):
 def require_exact(expected, actual, label):
     assert canonical(expected) == canonical(actual), {"contract": label, "expected": canonical(expected), "actual": canonical(actual)}
 
-require_exact(expected_outputs, actual_outputs, "materialized views")
+require_exact(expected_outputs, actual_outputs, "datasets")
 require_exact(expected_rules, actual_rules, "expectations")
 for expected, omitted, label in [
-    (expected_outputs, actual_outputs[:-1], "omitted materialized view fixture"),
+    (expected_outputs, actual_outputs[:-1], "omitted dataset fixture"),
     (expected_rules, actual_rules[:-1], "omitted expectation fixture"),
 ]:
     try:
@@ -381,7 +488,7 @@ python3 src/verify_pipeline_authoring.py \
 ```
 
 Expected: `authoring_manifests=passed omission_fixtures=passed`.
-Any omitted or extra materialized view, expectation rule, action, SQL expression, file, name, or FQN fails before deployment.
+Any omitted or extra dataset, object type, expectation rule, action, SQL expression, file, name, or FQN fails before deployment.
 
 ### 4. Add the native pipeline resource
 
@@ -408,6 +515,10 @@ resources:
 ```
 
 The resource uses the bundle variables resolved in the first step and has no schedule.
+Keep every bronze and silver dataset schema-qualified as shown above.
+Development mode may prefix the pipeline `target`, so an unqualified dataset can land in `dev_<user>_<target>` even when the bundle variable names the intended bronze schema.
+Schema-qualified dataset names preserve the requested medallion layout while the target remains the pipeline default.
+Default to serverless and keep each persisted dataset owned by one pipeline.
 
 ### 5. Deploy and resolve the pipeline ID
 
@@ -423,7 +534,16 @@ pipeline_id=$(
     --profile "$DATABRICKS_CONFIG_PROFILE" -o json \
   | jq -er --arg key "<pipeline_key>" '.resources.pipelines[$key].id'
 )
+pipeline=$(databricks pipelines get "$pipeline_id" \
+  --profile "$DATABRICKS_CONFIG_PROFILE" -o json)
+jq -e '
+  .spec.serverless == true
+  and .spec.continuous == false
+  and (.spec.channel | ascii_downcase) == "current"
+' >/dev/null <<<"$pipeline"
 ```
+
+Expected: deployment resolves one pipeline ID and the live pipeline is serverless, triggered, and on the current channel.
 
 ### 6. Capture the baseline, then start one update
 
@@ -478,15 +598,15 @@ Then verify object types, nonempty outputs, and numeric expectation counters fro
 mapfile -t output_fqns < <(
   jq -r '.[].fqn' <<<"$OUTPUT_MANIFEST_JSON" | LC_ALL=C sort
 )
-mapfile -t expectation_view_names < <(
-  jq -r '.[].materialized_view' <<<"$EXPECTATION_MANIFEST_JSON" \
+mapfile -t expectation_dataset_names < <(
+  jq -r '.[].dataset' <<<"$EXPECTATION_MANIFEST_JSON" \
     | LC_ALL=C sort -u
 )
-expectation_silver_fqns=()
-for expectation_view_name in "${expectation_view_names[@]}"
+expectation_dataset_fqns=()
+for expectation_dataset_name in "${expectation_dataset_names[@]}"
 do
-  expectation_silver_fqns+=("$(
-    jq -er --arg name "$expectation_view_name" '
+  expectation_dataset_fqns+=("$(
+    jq -er --arg name "$expectation_dataset_name" '
       [.[] | select(.name == $name)]
       | select(length == 1)
       | .[0].fqn
@@ -498,7 +618,7 @@ mapfile -t quality_rule_names < <(
 )
 test "${#output_fqns[@]}" -eq "$(jq 'length' <<<"$OUTPUT_MANIFEST_JSON")"
 test "${#quality_rule_names[@]}" -eq "$(jq 'length' <<<"$EXPECTATION_MANIFEST_JSON")"
-materialized_view_count=0
+dataset_count=0
 nonempty_output_count=0
 for output_fqn in "${output_fqns[@]}"
 do
@@ -506,8 +626,14 @@ do
     databricks tables get "$output_fqn" \
       --profile "$DATABRICKS_CONFIG_PROFILE" -o json
   )
-  jq -e '.table_type == "MATERIALIZED_VIEW"' >/dev/null <<<"$table"
-  materialized_view_count=$((materialized_view_count + 1))
+  expected_type=$(jq -er --arg fqn "$output_fqn" '
+    [.[] | select(.fqn == $fqn)]
+    | select(length == 1)
+    | .[0].type
+  ' <<<"$OUTPUT_MANIFEST_JSON")
+  jq -e --arg expected_type "$expected_type" \
+    '.table_type == $expected_type' >/dev/null <<<"$table"
+  dataset_count=$((dataset_count + 1))
   statement=$(printf 'SELECT count(*) FROM %s' "$output_fqn")
   run_sql "$statement" \
     | jq -e '
@@ -522,14 +648,14 @@ done
 expectations_file=$(mktemp)
 : >"$expectations_file"
 expectation_schema=$(printf 'array\74struct\74name:string,passed_records:bigint,failed_records:bigint\76\76')
-for silver_fqn in "${expectation_silver_fqns[@]}"
+for dataset_fqn in "${expectation_dataset_fqns[@]}"
 do
   statement=$(cat <<SQL
 SELECT
   expectation.name,
   expectation.passed_records,
   expectation.failed_records
-FROM event_log(TABLE($silver_fqn))
+FROM event_log(TABLE($dataset_fqn))
 LATERAL VIEW explode(
   from_json(
     get_json_object(details, '$.flow_progress.data_quality.expectations'),
@@ -568,9 +694,9 @@ jq -sr '
   | sort
   | .[]' "$expectations_file" >"$observed_rules"
 diff -u "$expected_rules" "$observed_rules"
-printf 'update=%s\nmaterialized_views=%s\nnonempty_outputs=%s\nexpectations=%s\n' \
+printf 'update=%s\ndatasets=%s\nnonempty_outputs=%s\nexpectations=%s\n' \
   "$state" \
-  "$materialized_view_count" \
+  "$dataset_count" \
   "$nonempty_output_count" \
   "$(wc -l <"$observed_rules" | tr -d ' ')"
 ```
@@ -579,10 +705,31 @@ Expected:
 
 ```text
 update=COMPLETED
-materialized_views=<configured-output-count>
+datasets=<configured-output-count>
 nonempty_outputs=<configured-output-count>
 expectations=<configured-rule-count>
 ```
+
+For file ingestion, record output counts, run one additional update without adding files, and require unchanged counts.
+Then add exactly one file and require only its valid rows to appear.
+Query `_rescued_data` and representative payloads so schema drift or malformed values cannot pass silently.
+
+For Auto CDC, verify current state and history separately.
+
+```sql
+SELECT count(*) AS current_rows
+FROM <catalog>.<silver_schema>.<scd_table>
+WHERE __END_AT IS NULL;
+
+SELECT <key>, __START_AT, __END_AT
+FROM <catalog>.<silver_schema>.<scd_table>
+ORDER BY <key>, __START_AT;
+```
+
+Verify one insert, update, and delete against the source event contract.
+Use selective refresh with fully qualified dataset names for focused recovery.
+Do not use full refresh as routine recovery because it resets streaming state and can reprocess data.
+Require explicit human approval after explaining the replay and data-loss impact of a full refresh.
 
 ## Where this fails
 
@@ -590,16 +737,21 @@ expectations=<configured-rule-count>
 |---|---|---|
 | Authentication check fails before validation | The profile targets another account, workspace, or host | Correct the named values or reauthenticate the intended profile before continuing |
 | Source precheck reports missing required columns | The human source mapping does not match the live table | Correct the mapping or approve revised dataset logic before authoring |
-| Source precheck fails before inspection | A source FQN is not three nonempty components or a redundant field differs from the parsed FQN | Correct the derived source specification before continuing |
+| Source precheck fails before inspection | A table FQN is malformed, a redundant field differs, or a file contract omits format, schema hints, or evolution mode | Correct the source specification before continuing |
 | Quality rule precheck fails | A rule is incomplete, duplicated, or uses an action other than `warn`, `drop`, or `fail` | Correct the rule contract before authoring |
-| Authoring manifest validation fails | A materialized view, expectation, action, expression, file, name, or FQN is omitted, extra, or changed | Reconcile the complete manifests and focused Python files before deployment |
+| Authoring manifest validation fails | A dataset, object type, expectation, action, expression, file, name, or FQN is omitted, extra, or changed | Reconcile the complete manifests and focused Python files before deployment |
 | Source inspection or deployment returns permission denied | The deployment principal lacks source, schema, or warehouse privileges | Grant the minimum required read, write, and warehouse permissions |
 | Pipeline source imports `dlt` | The project uses the legacy pipeline module | Replace it with `from pyspark import pipelines as dp` |
 | A batch source is read as a stream | The dataset uses a streaming read for a batch input | Use a materialized view with `spark.read.table` |
+| `CREATE_APPEND_ONCE_FLOW_FROM_BATCH_QUERY_NOT_ALLOWED` | A streaming-table file query omitted streaming semantics | Use Auto Loader with `spark.readStream` or `FROM STREAM read_files(...)` |
+| File ingestion silently loses malformed fields | Bronze omitted `_rescued_data` or chose an implicit evolution policy | Set the evolution policy explicitly and verify rescued payloads before silver |
+| Auto CDC reports an unresolved key or sequence column | The CDC contract does not match the source | Correct keys, operation mapping, and deterministic sequencing before rerunning |
 | Bundle validation reports a missing library | The resource path does not match `src/<pipeline_key>/` | Align `root_path`, the glob, and the source directory |
-| `tables get` reports another object type | The output was not published as a materialized view | Use `@dp.materialized_view` and redeploy |
+| A materialized view appears under `dev_<user>_<schema>` | Development mode rewrote the default target for an unqualified dataset | Publish every layer with its explicit `<schema>.<dataset>` name and redeploy |
+| Pipeline events say another pipeline owns the table | More than one pipeline publishes the same materialized-view FQN | Keep one owning pipeline or choose a new output FQN |
+| `tables get` reports another object type | The implementation does not match the manifest-declared dataset type | Use the selected materialized-view or streaming-table API and redeploy |
 | The row-count check returns zero | The source is empty or transformation logic removed every row | Inspect the selected source and rule actions before accepting the run |
-| The expectation query returns no numeric counters | Rules did not attach or the event log has no matching flow progress for the update | Inspect the grouped decorator and query the exact update ID |
+| The expectation query returns no numeric counters | Rules did not attach, the update ID is wrong, or no rows flowed in that streaming update | Inspect an update that processed rows before concluding the rules are absent |
 | Verification passes an idle pipeline while work is active | Polling uses top-level pipeline state or a different update | Poll `get-update` with both the resolved pipeline ID and returned update ID |
 
 ## Next

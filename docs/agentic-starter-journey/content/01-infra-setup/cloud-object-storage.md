@@ -46,6 +46,9 @@ Grant consumers `READ FILES` only.
 Do not grant `WRITE FILES`.
 If the human needs Databricks to write into this path, stop and say this page is the wrong path.
 Do not flip the location to read-write here.
+Evaluate this rule before auth preflight or skill invocation.
+For Databricks-managed writable storage, return to [Catalogs](/docs/01-infra-setup/catalogs/).
+For a writable external customer path, use the manual fallback under **Next**.
 
 ## Inputs
 
@@ -53,6 +56,8 @@ Do not flip the location to read-write here.
 |---|---|---|
 | Storage path | Human | Exact URI: `s3://bucket/prefix/`, `abfss://container@account.dfs.core.windows.net/prefix/`, or `gs://bucket/prefix/`. Ask for the full path, not just the bucket name. |
 | Which groups need read access | Human | Account-level groups. Grant `READ FILES` only. If the human omits groups (cold-start / eval brief), fall back to `account users`, grant `READ FILES` only, and log that the human did not name a group. |
+| Cloud identity selector | Human | AWS profile, active Azure CLI session, or active GCP account/configuration. Azure CLI does not have AWS-style named credential profiles. |
+| Azure tenant id | Human, Azure only | The tenant expected for the subscription and Databricks account. Compare it with `az account show`; do not change the active session to make a failed preflight pass. |
 | Cloud IAM identity | Skill-derived unless reusing | Default: skill creates the IAM role (AWS), Access Connector (Azure), or service account (GCP) with **read** permissions on the path. Only ask for an existing ARN/identity when reusing. |
 | Credential and location names | You derive | Prefer a ≤3-option naming pick when a human is present. If the brief already supplies names, or no human picker is available (cold-start Crew), use `<prefix>_cred_<purpose>` / `<prefix>_ext_<purpose>` (underscores) and record the choice. Do not stall waiting for a pick. |
 
@@ -66,7 +71,9 @@ List existing locations before proposing a path.
 
 ### 0. Auth precheck
 
-Refuse if the human did not name all of these: Databricks account id, Databricks account CLI profile, workspace host, workspace id, workspace CLI profile, target cloud (`aws`, `azure`, or `gcp`), cloud account id, cloud CLI profile.
+Evaluate the read-only hard rule before this step.
+Refuse if the human did not name all of these: Databricks account id, Databricks account CLI profile, workspace host, workspace id, workspace CLI profile, target cloud (`aws`, `azure`, or `gcp`), cloud account id, and the cloud identity selector.
+Also require the Azure tenant id for Azure.
 Do not invoke the skill until every named target is present.
 
 Run live checks:
@@ -74,10 +81,12 @@ Run live checks:
 ```bash
 databricks auth profiles
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
+databricks account workspaces get <workspace-id> --profile <account-profile> -o json \
+  | jq '{account_id, workspace_id, cloud, azure_workspace_info}'
 databricks metastores current --profile <workspace-profile> -o json | jq '{workspace_id, metastore_id, name}'
 databricks current-user me --profile <workspace-profile> -o json | jq '{userName, workspace_id}'
 aws sts get-caller-identity --profile <aws-profile>     # AWS: Account must equal named cloud account id
-az account show --profile <azure-profile>                  # Azure: tenant + subscription must match named ids
+az account show -o json | jq '{id, tenantId, user}'     # Azure: id and tenantId must match named ids
 gcloud auth list                                           # GCP: active account must match named project
 ```
 
@@ -85,7 +94,10 @@ Prefer `metastores current.workspace_id` (and/or account `workspaces get`) as th
 Treat `workspace_id: null` on `current-user me` as non-blocking when the workspace host matches and `metastores current` returns the named workspace id (common for SP oauth-m2m).
 
 Confirm the workspace profile reaches the named host and that the live workspace id matches the human-named workspace id.
-Compare live cloud identity and Databricks account id to the human-named values when obtainable.
+Confirm `account workspaces get.account_id` matches the named Databricks account id.
+On Azure, confirm `azure_workspace_info.subscription_id`, `az account show.id`, and the human-named subscription are identical.
+Also confirm `az account show.tenantId` matches the human-named Azure tenant.
+Do not run `az account set`, `az login`, or another command that changes identity to repair a failed preflight.
 
 On any failure, print **blocked: auth preflight failed**, name the failing check, give the human these remediations, and **stop**.
 Do not invoke the skill.
@@ -99,6 +111,7 @@ Do not run Terraform.
 | Workspace id mismatch | Fix workspace profile or human-named workspace id |
 | Cloud CLI not authenticated | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
 | Cloud account id mismatch | Pick the profile whose account id matches the human-named cloud account id |
+| Azure subscription or tenant mismatch | Activate the intended Azure identity outside this workflow, then rerun preflight |
 
 ### 1. Check what already exists
 
@@ -111,7 +124,25 @@ databricks storage-credentials list --profile <workspace-profile> -o json \
 ```
 
 If a location already covers the path, reuse it.
-Do not create a second overlapping location.
+Normalize trailing slashes before comparing URI prefixes.
+If an existing location is equal to, inside, or above the proposed path, print **refused: overlapping external location**, verify the proposed location name is absent, and stop before the skill or Terraform.
+
+On Azure, the exact ADLS directory in a non-root URI must already exist.
+When the active Azure user has data-plane access, check it before planning:
+
+```bash
+az storage fs directory exists \
+  --account-name <storage-account> \
+  --file-system <container> \
+  --name <prefix> \
+  --auth-mode login \
+  --query exists -o tsv
+```
+
+Expected: `true`.
+If the command is denied, ask the human to confirm the directory exists.
+Do not infer directory existence from the container alone.
+Do not create or seed the directory unless the human explicitly requests it.
 
 ### 2. Naming (new credential + location)
 
@@ -119,6 +150,11 @@ When a human is present, present ≤3 naming options for the credential and the 
 If the brief already supplies names, or no human picker is available (cold-start Crew), use `<prefix>_cred_<purpose>` / `<prefix>_ext_<purpose>` and record the choice.
 Do not invent a new bucket unless the human asked for one.
 This page's default is connect-to-existing path.
+
+When reusing a storage credential, inspect the credential and every location that references it.
+Reference it with a Terraform data source or literal credential name.
+The plan must not import, create, replace, or manage the credential, its cloud identity, or its IAM assignments.
+One credential may back several non-overlapping locations when its cloud identity can read each path.
 
 ### 3. Invoke the skill
 
@@ -133,10 +169,16 @@ On AWS the skill creates (or reuses) an IAM role whose trust policy allows the U
 Without self-assume in **both** trust and inline policy, credential validation fails with `non self-assuming role`.
 Then it creates the storage credential (role ARN) and the external location (`read_only = true`) in the workspace.
 
+Pin the Databricks provider to the human-named workspace host and profile.
+If the profile already supplies PAT or OAuth authentication, do not also set `auth_type` or `azure_tenant_id`.
+When supported by the provider, pin `workspace_id` and confirm it matches `metastores current` before planning.
+
 ### 4. Plan review
 
 Mandatory unless the brief already approved apply.
 Get explicit approval before `apply`, or record that the brief approved it.
+Apply only the exact saved plan the human approved.
+If the saved plan becomes stale, apply fails partway, or recovery changes the plan, save and present a new plan and wait for fresh approval.
 
 ## Verify
 
@@ -197,11 +239,14 @@ Do not leave probe objects behind on a successful write (that would mean the loc
 |---|---|---|
 | **blocked: auth preflight failed** before Run | Missing named account id, profiles, workspace host/id, or cloud account id | Ask the human for every required target; rerun ### 0 |
 | Cloud STS fails or account id mismatch | Expired or wrong cloud profile | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
+| Azure subscription or tenant differs from the named target | Wrong active Azure identity or target belongs to another tenant | Stop without changing the active session; have the human activate the matching identity, then rerun ### 0 |
 | Workspace profile fails `metastores current` | Expired workspace login or wrong host | `databricks auth login --host <workspace-host> --profile <workspace-profile>` |
+| Provider reports multiple auth methods or resolves another workspace | Profile auth was mixed with explicit Azure auth, or workspace metadata was ambiguous | Use the named profile and host without a second auth method; pin and verify the workspace id |
 | Skill invoked despite red precheck | Agent skipped ### 0 | Always run ### 0 first; stop on any failure |
 | SQL read fails on every operation | IAM role trust / Access Connector role assignment not propagated | Wait a minute and retry. Cloud IAM is eventually consistent. |
+| Azure location create returns `PathNotFound` or HTTP 404 | The ADLS directory in the URI does not exist | Have the path owner create the directory, then generate a fresh plan and get fresh approval |
 | `non self-assuming role` | AWS role missing `sts:AssumeRole` on its own ARN in the **inline** policy | Add the self-assume statement to the role policy, then re-validate |
-| `Overlapping external location` | Path is inside an existing location or a catalog's managed root | Pick a non-overlapping prefix, or reuse the existing location |
+| `Overlapping external location` | Path is equal to, inside, or above an existing location or catalog managed root | Normalize trailing slashes, stop before mutation, then pick a non-overlapping prefix or reuse the covering location |
 | `PERMISSION_DENIED` creating the credential | Caller lacks `CREATE STORAGE CREDENTIAL` on the metastore | Metastore admin grants it, or runs this step |
 | Location works for the creator only | Service principal owns it, no grants issued | Grant `READ FILES` to the consuming groups and `MANAGE` to the admin group |
 | Write succeeds against a "read" path | External location created without `read_only = true` | Recreate or update the location with `read_only = true`; do not grant `WRITE FILES` |

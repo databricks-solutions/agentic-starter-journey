@@ -217,4 +217,4 @@ Run `databricks bundle validate --target staging` and read the message rather th
 
 ## Next
 
-- **Do next:** [Ingestion Pipelines](/docs/02-databricks-projects/ingestion-pipelines/)
+- **Do next:** [Spark Declarative Pipelines](/docs/02-databricks-projects/etl-pipelines/)

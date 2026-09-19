@@ -41,7 +41,7 @@ Invoke these verified skills in order:
 | Fact source FQN | Human-provided | Provide the cleaned three-part source name |
 | Dimension definitions | Human-provided | Provide names, display names, expressions, comments, and required columns |
 | Measure definitions | Human-provided | Provide names, display names, aggregates, comments, and required columns |
-| Reconciliation policy | Human-provided | Provide dimension grain, decimal tolerances, and exact measures |
+| Reconciliation policy | Human-provided | Provide the dimension grain, which is the exact set of dimensions to group by. For every measure provide a comparison mode of exact for integer or count measures, or tolerance with a decimal bound for floating aggregates such as averages and ratios |
 | Join definition | Human-provided | Set `METRIC_JOIN_MODE` to `none` or `joined`; for `joined`, provide the source FQN, alias, `left` type, fact key, and dimension key |
 | Join quality | Human-provided | For `joined`, require nonnull keys, unique dimension keys, and zero unmatched fact rows |
 | Derived verification | Agent-derived | Resolve catalog, warehouse, FQN, and required columns; check source and key quality; translate the selected definition into raw baseline SQL |
@@ -113,6 +113,28 @@ case "$join_mode" in
     exit 1
     ;;
 esac
+# Verification model.
+# The metric view may have any number of dimensions and measures, not only three of each.
+# These two arrays are the single source of truth for every Verify step below.
+# Add one line per dimension and one line per measure the design actually has.
+#
+# Dimension entry: <name>|<raw_expr>.
+# raw_expr rebuilds the dimension from the raw sources, using the join alias for joined columns.
+dimensions=(
+  "<dimension_one>|<raw_dimension_one_expression>"
+  "<dimension_two>|<raw_dimension_two_expression>"
+  "<dimension_three>|<raw_dimension_three_expression>"
+)
+# Measure entry: <name>|<comparison>|<tolerance>|<raw_expr>.
+# comparison is exact for integer or count measures, or tolerance for floating aggregates such as averages.
+# tolerance is the decimal bound for tolerance measures and empty for exact measures.
+measures=(
+  "<measure_one>|tolerance|<decimal_tolerance>|<raw_measure_one_expression>"
+  "<measure_two>|exact||<raw_measure_two_expression>"
+  "<measure_three>|tolerance|<decimal_tolerance>|<raw_measure_three_expression>"
+)
+# One display name per dimension and per measure, matching the deployed column set exactly.
+# List every dimension and every measure, not only the first three.
 expected_display_names_json='{
   "<dimension_one>": "<dimension_one_display_name>",
   "<dimension_two>": "<dimension_two_display_name>",
@@ -121,6 +143,36 @@ expected_display_names_json='{
   "<measure_two>": "<measure_two_display_name>",
   "<measure_three>": "<measure_three_display_name>"
 }'
+# Raw baseline FROM clause for the selected branch.
+case "$join_mode" in
+  joined) raw_from="FROM $fact_fqn source LEFT JOIN $join_fqn $join_name ON source.$fact_join_key = $join_name.$join_key" ;;
+  none)   raw_from="FROM $fact_fqn source" ;;
+esac
+# Build the SQL fragments used by every Verify step from the arrays above.
+# Every dimension and every measure is covered, so a wider view cannot pass with unchecked columns.
+dim_list=; metric_measure_list=; raw_dim_list=; raw_measure_list=
+null_pred=; join_pred=; mismatch_pred=
+for dimension in "${dimensions[@]}"
+do
+  name=${dimension%%|*}; expr=${dimension#*|}
+  dim_list+="${dim_list:+, }$name"
+  raw_dim_list+="${raw_dim_list:+, }$expr AS $name"
+  null_pred+="${null_pred:+ OR }$name IS NULL"
+  join_pred+="${join_pred:+ AND }m.$name <=> r.$name"
+done
+for measure in "${measures[@]}"
+do
+  IFS='|' read -r name mode tolerance expr <<<"$measure"
+  metric_measure_list+=", MEASURE($name) AS $name"
+  raw_measure_list+=", $expr AS $name"
+  null_pred+=" OR $name IS NULL"
+  if test "$mode" = exact
+  then
+    mismatch_pred+="${mismatch_pred:+ OR }NOT (m.$name <=> r.$name)"
+  else
+    mismatch_pred+="${mismatch_pred:+ OR }m.$name IS NULL OR r.$name IS NULL OR abs(m.$name - r.$name) > $tolerance"
+  fi
+done
 
 run_sql() {
   local statement=$1 response statement_id state
@@ -432,21 +484,11 @@ The parser ignores comments, quoted scalar content, and indented literal or fold
 Its fixtures reject each false-positive shape before live metadata is evaluated.
 
 ```bash
-metric_cte=$(cat <<SQL
-metric AS (
-  SELECT
-    <dimension_one>,
-    <dimension_two>,
-    <dimension_three>,
-    MEASURE(<measure_one>) AS <measure_one>,
-    MEASURE(<measure_two>) AS <measure_two>,
-    MEASURE(<measure_three>) AS <measure_three>,
-    1 AS row_present
+metric_cte="metric AS (
+  SELECT $dim_list$metric_measure_list, 1 AS row_present
   FROM $metric_view_fqn
   GROUP BY ALL
-)
-SQL
-)
+)"
 metadata=$(
   run_sql "DESCRIBE TABLE EXTENDED $metric_view_fqn AS JSON"
 )
@@ -462,14 +504,7 @@ semantic_statement=$(cat <<SQL
 WITH $metric_cte
 SELECT
   count(*) AS metric_rows,
-  count_if(
-    <dimension_one> IS NULL
-    OR <dimension_two> IS NULL
-    OR <dimension_three> IS NULL
-    OR <measure_one> IS NULL
-    OR <measure_two> IS NULL
-    OR <measure_three> IS NULL
-  ) AS invalid_rows
+  count_if($null_pred) AS invalid_rows
 FROM metric
 SQL
 )
@@ -487,82 +522,33 @@ Expected: `metadata=passed semantic_query=passed`.
 
 ### Reconcile semantic and raw results
 
-Build the raw baseline independently for the selected branch:
+Build the raw baseline independently from the same dimension and measure lists:
 
 ```bash
-if test "$join_mode" = joined
-then
-  raw_cte=$(cat <<SQL
+raw_cte=$(cat <<SQL
 raw AS (
-  SELECT
-    <joined_raw_dimension_one_expression> AS <dimension_one>,
-    <joined_raw_dimension_two_expression> AS <dimension_two>,
-    <joined_raw_dimension_three_expression> AS <dimension_three>,
-    <raw_measure_one_expression> AS <measure_one>,
-    <raw_measure_two_expression> AS <measure_two>,
-    <raw_measure_three_expression> AS <measure_three>,
-    1 AS row_present
-  FROM $fact_fqn source
-  LEFT JOIN $join_fqn <join_name>
-    ON source.<fact_join_key> = <join_name>.<join_key>
+  SELECT $raw_dim_list$raw_measure_list, 1 AS row_present
+  $raw_from
   GROUP BY ALL
 )
 SQL
 )
-else
-  raw_cte=$(cat <<SQL
-raw AS (
-  SELECT
-    <no_join_raw_dimension_one_expression> AS <dimension_one>,
-    <no_join_raw_dimension_two_expression> AS <dimension_two>,
-    <no_join_raw_dimension_three_expression> AS <dimension_three>,
-    <raw_measure_one_expression> AS <measure_one>,
-    <raw_measure_two_expression> AS <measure_two>,
-    <raw_measure_three_expression> AS <measure_three>,
-    1 AS row_present
-  FROM $fact_fqn source
-  GROUP BY ALL
-)
-SQL
-)
-fi
 
 reconciliation_statement=$(cat <<SQL
 WITH $metric_cte,
 $raw_cte,
 validity AS (
   SELECT
-    (SELECT count(*) FROM metric WHERE
-      <dimension_one> IS NULL
-      OR <dimension_two> IS NULL
-      OR <dimension_three> IS NULL
-      OR <measure_one> IS NULL
-      OR <measure_two> IS NULL
-      OR <measure_three> IS NULL) AS metric_null_rows,
-    (SELECT count(*) FROM raw WHERE
-      <dimension_one> IS NULL
-      OR <dimension_two> IS NULL
-      OR <dimension_three> IS NULL
-      OR <measure_one> IS NULL
-      OR <measure_two> IS NULL
-      OR <measure_three> IS NULL) AS raw_null_rows
+    (SELECT count(*) FROM metric WHERE $null_pred) AS metric_null_rows,
+    (SELECT count(*) FROM raw WHERE $null_pred) AS raw_null_rows
 ),
 mismatches AS (
   SELECT 1
   FROM metric m
-  FULL OUTER JOIN raw r
-    ON m.<dimension_one> <=> r.<dimension_one>
-   AND m.<dimension_two> <=> r.<dimension_two>
-   AND m.<dimension_three> <=> r.<dimension_three>
+  FULL OUTER JOIN raw r ON $join_pred
   WHERE m.row_present IS NULL
      OR r.row_present IS NULL
-     OR m.<measure_one> IS NULL
-     OR r.<measure_one> IS NULL
-     OR abs(m.<measure_one> - r.<measure_one>) > <decimal_tolerance>
-     OR NOT (m.<measure_two> <=> r.<measure_two>)
-     OR m.<measure_three> IS NULL
-     OR r.<measure_three> IS NULL
-     OR abs(m.<measure_three> - r.<measure_three>) > <decimal_tolerance>
+     OR $mismatch_pred
 )
 SELECT
   (SELECT count(*) FROM metric) AS metric_rows,
@@ -592,8 +578,8 @@ printf '%s\n' \
 
 Expected: `metric_rows>0 metric_rows=raw_rows metric_null_rows=0 raw_null_rows=0 mismatch_rows=0`.
 
-Both raw SQL branches are independently executable.
-The result proves positive equal row counts, no nulls, configured comparisons and tolerances, and zero mismatches.
+The raw baseline is built independently from the same dimension and measure lists.
+The result proves positive equal row counts, no nulls, per measure comparisons and tolerances, and zero mismatches across every dimension and every measure.
 
 ## Where this fails
 
@@ -608,6 +594,8 @@ The result proves positive equal row counts, no nulls, configured comparisons an
 | Unmatched rows fail | A fact has no dimension match | Repair the source relationship before deployment |
 | Job is not successful | Its SQL task failed or was skipped | Repair the captured task error |
 | Semantic or reconciliation validation fails | Results contain nulls, unequal rows, or measure mismatches | Align source, dimensions, measures, grain, comparisons, and tolerance |
+| Verification passes but a dimension or measure is never checked | The dimensions or measures array omitted a column, so a wider view rolled up to the listed columns and the extra column went unverified | List every dimension and every measure in the arrays, then rerun |
+| Creation fails with INVALID_EXTRACT_BASE_FIELD_TYPE | A join alias has the same name as a dimension, so a joined column reference resolves to the dimension | Rename the join so its alias differs from every dimension name |
 
 ## Next
 

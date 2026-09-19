@@ -42,8 +42,9 @@ Invoke these verified skills in order:
 | Dashboard display name | Human-provided | Choose the unprefixed source display name |
 | Metric-view FQN | Human-provided | Provide the deployed three-part metric-view name |
 | Dataset questions | Human-provided | State the KPI and grouped question each dataset must answer |
+| Dataset display names | Human-provided | Provide a nonempty display name for every dataset, which the deploy API requires |
 | Expected dataset columns | Human-provided | List the ordered result columns for each question |
-| Widget types | Human-provided | Select a counter for the KPI and a bar chart for the breakdown |
+| Widget types | Human-provided | Select a supported Lakeview widget type per question, for example a counter for a KPI, a bar for a ranked breakdown, or a line for a trend. Confirm each type and its current version with the databricks-aibi-dashboards skill |
 | Field bindings | Human-provided | Map every widget field and encoding to an expected dataset column |
 | Page and widget layout | Human-provided | Provide page names, labels, and nonoverlapping grid positions |
 | Measure definition | Human-provided | Provide the measure name and display name used by both datasets |
@@ -143,6 +144,7 @@ Replace only placeholders represented in Inputs:
   "datasets": [
     {
       "name": "ds_kpi",
+      "displayName": "<kpi_dataset_display_name>",
       "queryLines": [
         "SELECT MEASURE(<measure_name>) AS <measure_name>\n",
         "FROM <bare_metric_view_name> "
@@ -150,6 +152,7 @@ Replace only placeholders represented in Inputs:
     },
     {
       "name": "ds_breakdown",
+      "displayName": "<breakdown_dataset_display_name>",
       "queryLines": [
         "SELECT <dimension_name>, MEASURE(<measure_name>) AS <measure_name>\n",
         "FROM <bare_metric_view_name>\n",
@@ -317,14 +320,15 @@ Validate structure, supported widget versions, complete theme, and exactly one b
 ```bash
 jq -e '
   (.datasets | length >= 2)
+  and all(.datasets[]; (.displayName | type == "string" and length > 0))
   and all(.datasets[]; all(.queryLines[]; endswith("\n") or endswith(" ")))
   and all(.pages[];
     .pageType == "PAGE_TYPE_CANVAS"
     and .layoutVersion == "GRID_V1"
     and all(.layout[].widget;
       (.spec == null)
-      or (.spec.widgetType == "counter" and .spec.version == 2)
-      or (.spec.widgetType == "bar" and .spec.version == 3)))
+      or ((.spec.widgetType | type == "string" and length > 0)
+          and (.spec.version | type == "number" and . >= 1))))
   and (.uiSettings.theme | keys | sort) == [
     "canvasBackgroundColor",
     "fontColor",
@@ -476,7 +480,7 @@ print("bare_from_tokens=passed")
 PY
 ```
 
-Expected: the source parses, every query fragment has a separator, page and widget versions match the contract, the theme is complete, and every `FROM` or `JOIN` relation exactly equals the selected bare metric-view name.
+Expected: the source parses, every query fragment has a separator, every dataset has a display name, every widget spec has a type and version, the theme is complete, and every `FROM` or `JOIN` relation exactly equals the selected bare metric-view name.
 The wrong-bare-table fixture must fail before the authored datasets are accepted.
 
 ### 2. Capture canonical source baselines
@@ -687,7 +691,8 @@ Expected: identity, duplicate, publish, and serialization checks report true, an
 | Catalog, schema, or warehouse resolution fails | The bundle variables or provided metric-view FQN are incomplete | Correct the active target or input before authoring the source |
 | Bare-name validation fails | A dataset has zero or multiple `FROM` clauses, a qualified name with or without spaces around dots, or an invalid table suffix | Keep exactly one bare table token after `FROM` and restore namespace injection on the resource |
 | Query-line validation fails | A fragment has no trailing newline or space | Restore the separator so adjacent SQL tokens cannot merge |
-| Counter or bar validation fails | The widget uses an unsupported type or version | Use counter version 2 and bar version 3 |
+| Widget validation fails | A widget spec is missing its type or version | Give every widget spec a widgetType and its current version, confirmed with the databricks-aibi-dashboards skill |
+| Deploy fails with datasets[...].displayName should not be empty | A dataset has no display name | Set a nonempty displayName on every dataset in the source |
 | A widget returns the wrong field | Its selected fields and encodings do not match expected dataset columns | Restore the exact field bindings from Inputs |
 | Theme validation fails | A required key is missing or renamed | Restore the complete theme contract before querying |
 | A local baseline is empty | The SQL, metric view, namespace, or warehouse is wrong | Repair the source query or target before deployment |

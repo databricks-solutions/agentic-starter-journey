@@ -21,10 +21,11 @@ One catalog per environment, each backed by its own object storage, with medalli
 ## Prerequisites
 
 - [Workspaces](/docs/01-infra-setup/workspaces/) complete, with a metastore in the region assigned to the workspace.
-- Auth surface: both (account profile, workspace profile, and cloud CLI for the target cloud).
+- Auth surface: both (account profile, workspace profile, and cloud CLI identity for the target cloud).
 - Account-admin auth that can run `databricks account metastores list` and `databricks account groups list`.
 - Account-level groups exist.
 Unity Catalog cannot see workspace-local groups.
+- The deploy principal belongs to the owning group, or a separate account-level human-admin group is named for post-transfer access.
 - Deploy principal has effective `CREATE_CATALOG`, `CREATE_STORAGE_CREDENTIAL`, and `CREATE_EXTERNAL_LOCATION` on the chosen metastore (shared metastores often lack these until granted).
 - Azure: subscription/RG rights include User Access Administrator (or Owner) so Access Connector role assignments can be written.
 Contributor alone is not enough.
@@ -65,6 +66,7 @@ Do not pick for the user.
 | Storage strategy | Human | Self-managed storage per catalog (recommended) or Databricks-managed metastore. The skill asks if unstated. |
 | Project name | Human | Drives schema names: `<project>_bronze`, `_silver`, `_gold` (page Verify expects this shape, not bare `bronze`) |
 | Owning group per project | Human | Must be account-level. Confirm against `databricks account groups list`. If create returns `WorkspaceGroup` / `meta.resourceType=WorkspaceGroup`, hard-fail and fix account SCIM. |
+| Human-admin group | Human | Account-level group that keeps verification and recovery access after ownership transfers. Optional only when the deploy principal belongs to every owning group. |
 | Metastore ID | You derive | `databricks account metastores list`, filtered to the region of the target workspace |
 | Workspace IDs | You derive | Needed when `isolation_mode = ISOLATED`. OPEN catalogs are visible to every workspace on that metastore without a binding resource. |
 | Resource prefix / bucket name | You derive | From the chosen storage naming convention. Globally unique. |
@@ -78,7 +80,10 @@ The skill refuses a shared one: shared storage across environments means a dev j
 
 ### 0. Auth precheck
 
-Refuse if the human did not name all of these: Databricks account id, Databricks account CLI profile, workspace host, workspace id, workspace CLI profile, target cloud (`aws`, `azure`, or `gcp`), cloud account id, cloud CLI profile.
+Refuse if the human did not name all of these: Databricks account id, Databricks account CLI profile, workspace host, workspace id, workspace CLI profile, target cloud (`aws`, `azure`, or `gcp`), and the cloud identity selector.
+For AWS, require an account id and CLI profile.
+For Azure, require a tenant id, subscription id, and active Azure CLI context.
+For GCP, require a project id and active CLI account.
 Do not invoke the skill until every named target is present.
 
 Run live checks:
@@ -86,14 +91,18 @@ Run live checks:
 ```bash
 databricks auth profiles
 databricks account workspaces list --profile <account-profile> -o json | jq 'length'
-databricks metastores current --profile <workspace-profile> -o json | jq '{workspace_id, metastore_id, name}'
-databricks current-user me --profile <workspace-profile> -o json | jq '{userName, workspace_id}'
+databricks metastores current --profile <workspace-profile> -o json | jq '{workspace_id, metastore_id}'
+databricks current-user me --profile <workspace-profile> -o json | jq '{userName, id}'
+databricks auth describe --profile <workspace-profile>
+databricks account workspaces list --profile <account-profile> -o json \
+  | jq '.[] | select(.workspace_id == <workspace-id>) | {workspace_id, deployment_name, workspace_status}'
 aws sts get-caller-identity --profile <aws-profile>     # AWS: Account must equal named cloud account id
-az account show --profile <azure-profile>                  # Azure: tenant + subscription must match named ids
+az account show -o json | jq '{tenantId, id, name, user}' # Azure: tenant + subscription must match named ids
 gcloud auth list                                           # GCP: active account must match named project
 ```
 
-Confirm the workspace profile reaches the named host and that `workspace_id` matches the human-named workspace id.
+Confirm `auth describe` shows the named host.
+If it shows a configured `workspace_id`, require that value to match the human-named workspace id even when live CLI calls reach the correct host.
 Compare live cloud identity and Databricks account id to the human-named values when obtainable.
 
 On any failure, print **blocked: auth preflight failed**, name the failing check, give the human these remediations, and **stop**.
@@ -106,7 +115,8 @@ Do not run Terraform.
 | `account workspaces list` fails | Confirm Account admin on the SP; regenerate OAuth secret (AWS) |
 | `metastores current` or `current-user me` fails | `databricks auth login --host <workspace-host> --profile <workspace-profile>` |
 | Workspace id mismatch | Fix workspace profile or human-named workspace id |
-| Cloud CLI not authenticated | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
+| Configured workspace id mismatch in `auth describe` | Remove or correct `workspace_id` in the named profile, or use explicit `host` plus cloud-native provider auth |
+| Cloud CLI not authenticated | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant-id>` then `az account set --subscription <subscription-id>` / `gcloud auth login` |
 | Cloud account id mismatch | Pick the profile whose account id matches the human-named cloud account id |
 
 ### 1. Check the metastore before touching it
@@ -157,9 +167,15 @@ State the exact strings you will pass into Terraform for the chosen option (cata
 
 Pass the layout decision, the environment list, the project name, the owning groups, and the chosen naming mapping.
 It writes the Terraform for storage plus credential plus external location plus catalog plus schemas plus grants, then runs `init` and `plan`.
+The page's `<project>_bronze`, `<project>_silver`, and `<project>_gold` schema names override the skill's bare medallion examples.
+
+For Azure Terraform, use exactly one Databricks authentication method per provider.
+Either set `profile = "<workspace-profile>"` without `azure_tenant_id`, or set `host`, `azure_tenant_id`, and `auth_type = "azure-cli"` without `profile`.
 
 Create catalog and schemas as the deployer first.
+Before transferring ownership, confirm the deploy principal belongs to the owning group or grant the named human-admin group `ALL_PRIVILEGES` on the new catalog and schemas.
 After schemas exist, transfer catalog and schema ownership to the account group (`databricks catalogs update --owner` / schema equivalent, or Terraform ownership resources).
+Keep the final catalog and schema owners in Terraform configuration even when CLI commands stage the transfer.
 Setting `owner = group` before schema create can drop the deployer's `CREATE SCHEMA`.
 Do not leave the deploy SP as owner when Verify expects the group.
 
@@ -180,13 +196,22 @@ If the human already approved apply in the task brief, apply and record that app
 ## Verify
 
 ```bash
+set -o pipefail
+
 # Every catalog exists with its own storage root
-databricks catalogs list --profile <workspace-profile> -o json \
+catalogs_json="$(databricks catalogs list --profile <workspace-profile> -o json)" || exit 1
+printf '%s\n' "$catalogs_json" \
   | jq -r '.[] | select(.name | startswith("<prefix>") or test("^(dev|stg|prod|sandbox)")) | "\(.name)\t\(.owner)\t\(.storage_root)"'
 
-# Storage roots are distinct: this must print nothing
-databricks catalogs list --profile <workspace-profile> -o json \
-  | jq -r '[.[] | select(.storage_root != null) | .storage_root] | group_by(.) | map(select(length > 1)) | .[][]'
+# Storage roots for catalogs created by this run are non-null and distinct.
+# This must print nothing.
+printf '%s\n' "$catalogs_json" \
+  | jq --argjson names '["<catalog-1>","<catalog-2>"]' '
+      [.[] | select(.name as $name | $names | index($name)) | .storage_root]
+      | if length == ($names | length) and all(. != null) and (unique | length) == length
+        then empty
+        else error("requested catalogs are missing, managed, or share a storage root")
+        end'
 
 # Medallion schemas present (positional catalog name; --catalog is not valid on CLI 1.1.0)
 databricks schemas list <catalog> --profile <workspace-profile> -o json | jq -r '.[] | .name'
@@ -200,9 +225,23 @@ databricks grants get SCHEMA <catalog>.<project>_gold --profile <workspace-profi
 
 # Production is bound to the production workspace only
 databricks catalogs get <prod-catalog> --profile <workspace-profile> -o json | jq '{name, isolation_mode}'
+
+# Every isolated catalog has exactly the intended read-write binding
+databricks workspace-bindings get-bindings catalog <isolated-catalog> \
+  --profile <workspace-profile> -o json \
+  | jq -e 'length == 1
+      and .[0].workspace_id == <workspace-id>
+      and .[0].binding_type == "BINDING_TYPE_READ_WRITE"' >/dev/null
+
+# The recovery group can manage the external location
+databricks grants get EXTERNAL_LOCATION <external-location> \
+  --profile <workspace-profile> -o json \
+  | jq -e --arg admin "<human-admin-group>" '
+      any(.privilege_assignments[]?;
+        .principal == $admin and (.privileges | index("MANAGE")))' >/dev/null
 ```
 
-Expected: account group as catalog owner (after transfer), the duplicate-storage check silent, `<project>_bronze` / `_silver` / `_gold` listed, and `ISOLATED` on the production catalog when applicable.
+Expected: account group as catalog owner after transfer, the distinct-storage check silent, `<project>_bronze` / `_silver` / `_gold` listed, and exact read-write bindings on every isolated catalog.
 
 Then confirm data actually moves.
 One statement per request (semicolon-chained statements fail with `PARSE_SYNTAX_ERROR`):
@@ -224,7 +263,7 @@ databricks api post /api/2.0/sql/statements --profile <workspace-profile> --json
   "warehouse_id": "<warehouse-id>",
   "statement": "SELECT count(*) FROM <catalog>.<project>_bronze._verify",
   "wait_timeout": "50s"
-}' | jq -r '.status.state'
+}' | jq -r '[.status.state, .result.data_array[0][0]] | @tsv'
 
 databricks api post /api/2.0/sql/statements --profile <workspace-profile> --json '{
   "warehouse_id": "<warehouse-id>",
@@ -233,32 +272,53 @@ databricks api post /api/2.0/sql/statements --profile <workspace-profile> --json
 }' | jq -r '.status.state'
 ```
 
-Expected text each time:
+Expected for create, insert, and drop:
 
 ```text
 SUCCEEDED
 ```
 
+Expected for count:
+
+```text
+SUCCEEDED	1
+```
+
 A failure here with the metadata all correct usually means the storage credential cannot reach the bucket.
+
+Finish from the Terraform state directory:
+
+```bash
+terraform plan -detailed-exitcode
+```
+
+Expected exit code: `0`.
+Exit code `2` means the generated configuration does not describe the final applied ownership, grants, binding, or policy changes.
 
 ## Where this fails
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| **blocked: auth preflight failed** before Run | Missing named account id, profiles, workspace host/id, or cloud account id | Ask the human for every required target; rerun ### 0 |
+| **blocked: auth preflight failed** before Run | Missing named account id, Databricks profiles, workspace host/id, or cloud identity selector | Ask the human for every required target; rerun ### 0 |
 | Workspace profile fails `metastores current` | Expired workspace login or wrong host | `databricks auth login --host <workspace-host> --profile <workspace-profile>` |
 | Workspace id mismatch | Wrong workspace profile | Fix profile or human-named workspace id |
-| Cloud STS fails or account id mismatch | Expired or wrong cloud profile | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant>` / `gcloud auth login` |
+| CLI gates pass but Terraform reports `workspace_id mismatch` | Named profile contains a stale configured `workspace_id` | Correct or remove it, or use `host` plus cloud-native provider auth without `profile` |
+| Cloud identity fails or does not match | Expired or wrong cloud context | `aws sso login --profile <aws-profile>` / `az login --tenant <tenant-id>` then `az account set --subscription <subscription-id>` / `gcloud auth login` |
+| Azure CLI rejects `--profile` | Azure CLI has no named-profile flag | Use the active context from `az account show`; isolate contexts with `AZURE_CONFIG_DIR` when required |
+| Terraform reports more than one authorization method | Azure provider combines `profile` with `azure_tenant_id` | Use workspace `profile` alone, or use `host` plus `azure-cli` auth without `profile` |
 | Skill invoked despite red precheck | Agent skipped ### 0 | Always run ### 0 first; stop on any failure |
 | `PERMISSION_DENIED: User is not an owner of Metastore` | Caller cannot create catalogs | Grant CREATE_* on the metastore, or add them to the metastore admin group |
 | `No metastore assigned` | Workspace not attached to a metastore | Account admin assigns or creates the regional metastore, then retry |
 | Catalog created, admins cannot see it | A service principal created and therefore owns it | Transfer owner to the account group after schemas exist; grant `ALL_PRIVILEGES` and `MANAGE` as needed |
+| Verify loses `USE CATALOG` after ownership transfer | Deployer is not in the owning group and no human-admin grant exists | Add the deployer to the owning group or grant the named account-level human-admin group before transfer |
 | Classic compute cannot read the catalog | Databricks-managed metastore storage, which is serverless-only | Deploy a self-managed metastore with the customer's own bucket |
 | `Storage root already in use` | Two catalogs pointed at one location | One dedicated bucket or container per catalog |
 | Grants applied but the group sees nothing | Group is workspace-local | Recreate at account level; never use WorkspaceGroup for UC |
 | Production catalog visible from dev | `isolation_mode` left `OPEN`, or no workspace binding | Set `ISOLATED` and add `databricks_workspace_binding` |
+| Catalog is `ISOLATED` but unavailable or visible in the wrong workspace | Binding is missing, read-only, or targets the wrong workspace | Assert the exact workspace id and `BINDING_TYPE_READ_WRITE` with `workspace-bindings get-bindings` |
 | Cannot attach one catalog to workspaces in two regions | Catalog is metastore-scoped; metastores are regional | Create one catalog per region/metastore; same name is fine |
 | Owner still the deploy SP after apply | Ownership transfer skipped | Transfer owner to the account group after schemas exist |
+| Distinct-storage check reports unrelated catalogs | Verification scanned the whole metastore | Restrict the check to catalog names created by the current run |
 | Bucket missing org-required prefix (example `databricks-`) | Naming step skipped or option A assumed | Re-run Naming; pick the cloud-prefix option before apply |
 | Azure `AuthorizationFailed` on role assignment | No User Access Administrator / Owner | Elevate RBAC, then recreate Access Connector grants |
 
